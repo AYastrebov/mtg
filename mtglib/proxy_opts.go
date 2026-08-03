@@ -9,8 +9,20 @@ import "time"
 type ProxyOpts struct {
 	// Secret defines a secret which should be used by a proxy.
 	//
-	// This is a mandatory setting.
+	// Either this or Secrets is mandatory. When Secrets is set, this is
+	// ignored.
 	Secret Secret
+
+	// Secrets defines the set of secrets a proxy accepts, so that one proxy can
+	// serve many clients with individually revocable credentials. Which secret
+	// authenticated a connection is reported as EventClientMatched, letting a
+	// caller attribute traffic per client.
+	//
+	// Every secret must carry the same Host: the FakeTLS SNI check runs once,
+	// before any key is tried, so a per-secret hostname could never match.
+	//
+	// Either this or Secret is mandatory.
+	Secrets []Secret
 
 	// Network defines a network instance which should be used for all network
 	// communications made by proxies.
@@ -193,8 +205,35 @@ func (p ProxyOpts) valid() error {
 		return ErrEventStreamIsNotDefined
 	case p.Logger == nil:
 		return ErrLoggerIsNotDefined
-	case !p.Secret.Valid():
+	}
+
+	secrets := p.getSecrets()
+	if len(secrets) == 0 {
 		return ErrSecretInvalid
+	}
+
+	for _, secret := range secrets {
+		if !secret.Valid() {
+			return ErrSecretInvalid
+		}
+
+		if secret.Host != secrets[0].Host {
+			return ErrSecretHostMismatch
+		}
+	}
+
+	return nil
+}
+
+// getSecrets normalises Secret/Secrets into the list a proxy actually serves.
+// Secrets wins when both are set.
+func (p ProxyOpts) getSecrets() []Secret {
+	if len(p.Secrets) > 0 {
+		return p.Secrets
+	}
+
+	if p.Secret.Valid() {
+		return []Secret{p.Secret}
 	}
 
 	return nil

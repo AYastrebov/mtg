@@ -12,10 +12,10 @@ import (
 	"github.com/9seconds/mtg/v2/essentials"
 	"github.com/9seconds/mtg/v2/mtglib/internal/dc"
 	"github.com/9seconds/mtg/v2/mtglib/internal/doppel"
-	"github.com/9seconds/mtg/v2/mtglib/obfuscation"
 	"github.com/9seconds/mtg/v2/mtglib/internal/relay"
 	"github.com/9seconds/mtg/v2/mtglib/internal/tls"
 	"github.com/9seconds/mtg/v2/mtglib/internal/tls/fake"
+	"github.com/9seconds/mtg/v2/mtglib/obfuscation"
 	"github.com/panjf2000/ants/v2"
 )
 
@@ -36,9 +36,8 @@ type Proxy struct {
 	telegram                    *dc.Telegram
 	configUpdater               *dc.PublicConfigUpdater
 	doppelGanger                *doppel.Ganger
-	clientObfuscatror           obfuscation.Obfuscator
 
-	secret          Secret
+	secrets         []Secret
 	network         Network
 	antiReplayCache AntiReplayCache
 	blocklist       IPBlocklist
@@ -51,7 +50,9 @@ type Proxy struct {
 // If a fronting host (literal IP or hostname) is configured, it is used
 // instead of resolving the secret's hostname.
 func (p *Proxy) DomainFrontingAddress() string {
-	host := p.secret.Host
+	// Every secret shares a host (enforced by ProxyOpts.valid), so the first is
+	// as good as any.
+	host := p.secrets[0].Host
 	if p.domainFrontingHost != "" {
 		host = p.domainFrontingHost
 	}
@@ -97,7 +98,7 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	}
 	defer clientConn.Stop()
 
-	ctx.clientConn = clientConn
+	ctx.setClientConn(clientConn)
 
 	if err := p.doObfuscatedHandshake(ctx); err != nil {
 		ctx.logger.InfoError("obfuscated handshake is failed", err)
@@ -186,13 +187,26 @@ func (p *Proxy) Shutdown() {
 	p.blocklist.Shutdown()
 }
 
+// secretKeys returns the candidate key material in Secrets order. The order is
+// the contract with EventClientMatched: an index into this slice is an index
+// into Secrets.
+func (p *Proxy) secretKeys() [][]byte {
+	keys := make([][]byte, len(p.secrets))
+
+	for i := range p.secrets {
+		keys[i] = p.secrets[i].Key[:]
+	}
+
+	return keys
+}
+
 func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	rewind := newConnRewind(ctx.clientConn)
 
-	clientHello, err := fake.ReadClientHello(
+	clientHello, secretIdx, err := fake.ReadClientHello(
 		rewind,
-		p.secret.Key[:],
-		p.secret.Host,
+		p.secretKeys(),
+		p.secrets[0].Host,
 		p.tolerateTimeSkewness,
 	)
 	if err != nil {
@@ -211,24 +225,44 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	gangerNoise := p.doppelGanger.NoiseParams()
 	noiseParams := fake.NoiseParams{Mean: gangerNoise.Mean, Jitter: gangerNoise.Jitter}
 
-	if err := fake.SendServerHello(ctx.clientConn, p.secret.Key[:], clientHello, noiseParams); err != nil {
+	matchedKey := p.secrets[secretIdx].Key[:]
+
+	if err := fake.SendServerHello(ctx.clientConn, matchedKey, clientHello, noiseParams); err != nil {
 		p.logger.InfoError("cannot send welcome packet", err)
 		return false
 	}
 
-	ctx.clientConn = tls.New(ctx.clientConn, true, false)
+	ctx.setClientConn(tls.New(ctx.clientConn, true, false))
+
+	// Announced only once the handshake has fully succeeded and the replay
+	// check has passed, so a consumer never attributes traffic to a client on
+	// the strength of a replayed or half-finished handshake.
+	ctx.secretIdx = secretIdx
+	ctx.logger = ctx.logger.BindInt("secret", secretIdx)
+	p.eventStream.Send(ctx, NewEventClientMatched(ctx.streamID, secretIdx))
 
 	return true
 }
 
 func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
-	dc, conn, err := p.clientObfuscatror.ReadHandshake(ctx.clientConn)
+	// ServeConn only gets here after doFakeTLSHandshake succeeded, so the index
+	// is always set. Checked anyway rather than indexing with -1: this runs on
+	// a worker goroutine, where a panic takes the process down.
+	if ctx.secretIdx < 0 || ctx.secretIdx >= len(p.secrets) {
+		return fmt.Errorf("stream has no matched secret (index %d)", ctx.secretIdx)
+	}
+
+	// Keyed by the secret that authenticated this stream, not a proxy-wide one:
+	// with many secrets in play they are different things.
+	obfuscator := obfuscation.Obfuscator{Secret: p.secrets[ctx.secretIdx].Key[:]}
+
+	dc, conn, err := obfuscator.ReadHandshake(ctx.clientConn)
 	if err != nil {
 		return fmt.Errorf("cannot process client handshake: %w", err)
 	}
 
 	ctx.dc = dc
-	ctx.clientConn = conn
+	ctx.setClientConn(conn)
 	ctx.logger = ctx.logger.BindInt("dc", dc)
 
 	return nil
@@ -271,12 +305,12 @@ func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 		return fmt.Errorf("cannot perform server handshake: %w", err)
 	}
 
-	ctx.telegramConn = connTraffic{
+	ctx.setTelegramConn(connTraffic{
 		Conn:     tgConn,
 		streamID: ctx.streamID,
 		stream:   p.eventStream,
 		ctx:      ctx,
-	}
+	})
 
 	telegramHost, _, err := net.SplitHostPort(foundAddr.Address)
 	if err != nil {
@@ -351,7 +385,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	proxy := &Proxy{
 		ctx:                      ctx,
 		ctxCancel:                cancel,
-		secret:                   opts.Secret,
+		secrets:                  opts.getSecrets(),
 		network:                  opts.Network,
 		antiReplayCache:          opts.AntiReplayCache,
 		blocklist:                opts.IPBlocklist,
@@ -379,9 +413,6 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 			updatersLogger.Named("public-config"),
 			opts.Network.MakeHTTPClient(nil),
 		),
-		clientObfuscatror: obfuscation.Obfuscator{
-			Secret: opts.Secret.Key[:],
-		},
 		domainFrontingProxyProtocol: opts.DomainFrontingProxyProtocol,
 	}
 

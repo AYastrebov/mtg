@@ -35,6 +35,11 @@ var (
 	// value is invalid (no host or payload are zeroes).
 	ErrSecretInvalid = errors.New("secret is invalid")
 
+	// ErrSecretHostMismatch is returned if ProxyOpts.Secrets carry different
+	// hosts. The FakeTLS SNI check runs once, before any key is tried, so a
+	// secret whose host differs from the rest could never authenticate.
+	ErrSecretHostMismatch = errors.New("all secrets must share the same host")
+
 	// ErrNetworkIsNotDefined is returned if you are trying to create a proxy but
 	// network value is undefined.
 	ErrNetworkIsNotDefined = errors.New("network is not defined")

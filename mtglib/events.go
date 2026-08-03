@@ -61,6 +61,25 @@ type EventTraffic struct {
 	IsRead bool
 }
 
+// EventClientMatched is emitted once per connection, when a secret from
+// ProxyOpts.Secrets has authenticated the FakeTLS handshake.
+//
+// It is a distinct event rather than a field on EventStart because EventStart
+// is emitted before the handshake runs, when no secret has been tried yet. It
+// is guaranteed to precede every EventTraffic for the same stream: traffic
+// events originate in the wrapper installed while connecting to Telegram,
+// which happens after the handshake.
+//
+// Domain-fronted connections never emit it, so a consumer mapping streams to
+// clients should ignore traffic for a stream it has not seen matched.
+type EventClientMatched struct {
+	eventBase
+
+	// SecretIdx is the position in ProxyOpts.Secrets of the secret that
+	// authenticated this connection.
+	SecretIdx int
+}
+
 // EventFinish is emitted when we stop to manage a connection.
 type EventFinish struct {
 	eventBase
@@ -134,6 +153,17 @@ func NewEventTraffic(streamID string, traffic uint, isRead bool) EventTraffic {
 		},
 		Traffic: traffic,
 		IsRead:  isRead,
+	}
+}
+
+// NewEventClientMatched creates a new EventClientMatched event.
+func NewEventClientMatched(streamID string, secretIdx int) EventClientMatched {
+	return EventClientMatched{
+		eventBase: eventBase{
+			timestamp: time.Now(),
+			streamID:  streamID,
+		},
+		SecretIdx: secretIdx,
 	}
 }
 
