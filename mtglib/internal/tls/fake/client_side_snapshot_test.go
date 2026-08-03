@@ -94,9 +94,9 @@ func (suite *ParseClientHelloSnapshotTestSuite) TestSnapshotOk() {
 			connMock := suite.makeConn(snapshot.GetFull())
 			defer connMock.AssertExpectations(t)
 
-			hello, err := fake.ReadClientHello(
+			hello, _, err := fake.ReadClientHello(
 				connMock,
-				suite.secret.Key[:],
+				[][]byte{suite.secret.Key[:]},
 				suite.secret.Host,
 				TolerateTime,
 			)
@@ -130,9 +130,9 @@ func (suite *ParseClientHelloSnapshotTestSuite) TestSnapshotBad() {
 			connMock := suite.makeConn(snapshot.GetFull())
 			defer connMock.AssertExpectations(t)
 
-			_, err = fake.ReadClientHello(
+			_, _, err = fake.ReadClientHello(
 				connMock,
-				suite.secret.Key[:],
+				[][]byte{suite.secret.Key[:]},
 				suite.secret.Host,
 				TolerateTime,
 			)

@@ -63,12 +63,12 @@ type ParseClientHello_TLSHeaderTestSuite struct {
 }
 
 func (suite *ParseClientHello_TLSHeaderTestSuite) TestEmpty() {
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read client hello")
 }
 
 func (suite *ParseClientHello_TLSHeaderTestSuite) TestNothing() {
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorIs(err, io.EOF)
 }
 
@@ -80,7 +80,7 @@ func (suite *ParseClientHello_TLSHeaderTestSuite) TestUnknownRecord() {
 	})
 	suite.readBuf.WriteByte(10)
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "unexpected record type 0xa")
 }
 
@@ -91,7 +91,7 @@ func (suite *ParseClientHello_TLSHeaderTestSuite) TestUnknownProtocolVersion() {
 		0, 0,
 	})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "unexpected protocol version")
 }
 
@@ -102,7 +102,7 @@ func (suite *ParseClientHello_TLSHeaderTestSuite) TestCannotReadRestOfRecord() {
 		0, 10,
 	})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorIs(err, io.EOF)
 }
 
@@ -126,7 +126,7 @@ func (suite *ParseClientHelloHandshakeTestSuite) TestCannotReadHeader() {
 		10,
 	})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read handshake header")
 }
 
@@ -136,7 +136,7 @@ func (suite *ParseClientHelloHandshakeTestSuite) TestIncorrectHandshakeType() {
 		10, 0, 0, 0,
 	})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "incorrect handshake type")
 }
 
@@ -146,7 +146,7 @@ func (suite *ParseClientHelloHandshakeTestSuite) TestCannotReadHandshake() {
 		10, 0, 0, 0,
 	})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorIs(err, io.EOF)
 }
 
@@ -176,14 +176,14 @@ func (suite *ParseClientHelloHandshakeBodyTestSuite) writeBody(body []byte) {
 func (suite *ParseClientHelloHandshakeBodyTestSuite) TestCannotReadVersion() {
 	suite.writeBody(nil)
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read client version")
 }
 
 func (suite *ParseClientHelloHandshakeBodyTestSuite) TestCannotReadRandom() {
 	suite.writeBody([]byte{3, 3})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read client random")
 }
 
@@ -192,7 +192,7 @@ func (suite *ParseClientHelloHandshakeBodyTestSuite) TestCannotReadSessionIDLeng
 
 	suite.writeBody(body)
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read session ID length")
 }
 
@@ -202,7 +202,7 @@ func (suite *ParseClientHelloHandshakeBodyTestSuite) TestCannotReadSessionID() {
 
 	suite.writeBody(body)
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read session id")
 }
 
@@ -211,7 +211,7 @@ func (suite *ParseClientHelloHandshakeBodyTestSuite) TestCannotReadCipherSuiteLe
 
 	suite.writeBody(body)
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read cipher suite length")
 }
 
@@ -221,7 +221,7 @@ func (suite *ParseClientHelloHandshakeBodyTestSuite) TestCannotReadFirstCipherSu
 
 	suite.writeBody(body)
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read cipher suite")
 }
 
@@ -231,7 +231,7 @@ func (suite *ParseClientHelloHandshakeBodyTestSuite) TestCannotSkipRemainingCiph
 
 	suite.writeBody(body)
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read cipher suite")
 }
 
@@ -245,7 +245,7 @@ func (suite *ParseClientHelloHandshakeBodyTestSuite) TestCannotFindCipher() {
 
 	suite.writeBody(body)
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorIs(err, fake.ErrCannotFindCipher)
 }
 
@@ -256,7 +256,7 @@ func (suite *ParseClientHelloHandshakeBodyTestSuite) TestCannotReadCompressionMe
 
 	suite.writeBody(body)
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read compression methods length")
 }
 
@@ -268,7 +268,7 @@ func (suite *ParseClientHelloHandshakeBodyTestSuite) TestCannotSkipCompressionMe
 
 	suite.writeBody(body)
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot skip compression methods")
 }
 
@@ -309,70 +309,70 @@ func (suite *ParseClientHelloSNITestSuite) writeExtensions(extensions []byte) {
 func (suite *ParseClientHelloSNITestSuite) TestCannotReadExtensionsLength() {
 	suite.writeExtensions(nil)
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read length of TLS extensions")
 }
 
 func (suite *ParseClientHelloSNITestSuite) TestCannotReadExtensions() {
 	suite.writeExtensions([]byte{0, 10})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read extensions")
 }
 
 func (suite *ParseClientHelloSNITestSuite) TestCannotReadExtensionType() {
 	suite.writeExtensions([]byte{0, 1, 0xAB})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read extension type")
 }
 
 func (suite *ParseClientHelloSNITestSuite) TestCannotReadExtensionLength() {
 	suite.writeExtensions([]byte{0, 2, 0xFF, 0xFF})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "length:")
 }
 
 func (suite *ParseClientHelloSNITestSuite) TestCannotReadExtensionData() {
 	suite.writeExtensions([]byte{0, 4, 0xFF, 0xFF, 0, 5})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "data: len")
 }
 
 func (suite *ParseClientHelloSNITestSuite) TestCannotReadSNIRecordLength() {
 	suite.writeExtensions([]byte{0, 5, 0, 0, 0, 1, 0xAB})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read the length of the SNI record")
 }
 
 func (suite *ParseClientHelloSNITestSuite) TestCannotReadSNIListType() {
 	suite.writeExtensions([]byte{0, 6, 0, 0, 0, 2, 0, 1})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "cannot read SNI list type")
 }
 
 func (suite *ParseClientHelloSNITestSuite) TestIncorrectSNIListType() {
 	suite.writeExtensions([]byte{0, 7, 0, 0, 0, 3, 0, 1, 5})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "incorrect SNI list type")
 }
 
 func (suite *ParseClientHelloSNITestSuite) TestCannotReadHostnameLength() {
 	suite.writeExtensions([]byte{0, 8, 0, 0, 0, 4, 0, 2, 0, 0xAB})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "incorrect length of the hostname")
 }
 
 func (suite *ParseClientHelloSNITestSuite) TestCannotReadHostname() {
 	suite.writeExtensions([]byte{0, 9, 0, 0, 0, 5, 0, 3, 0, 0, 5})
 
-	_, err := fake.ReadClientHello(suite.connMock, suite.secret.Key[:], suite.secret.Host, TolerateTime)
+	_, _, err := fake.ReadClientHello(suite.connMock, [][]byte{suite.secret.Key[:]}, suite.secret.Host, TolerateTime)
 	suite.ErrorContains(err, "incorrect length of SNI hostname")
 }
 
@@ -499,9 +499,9 @@ func (s *ParseClientHelloFragmentedTestSuite) TestReassemblySuccess() {
 			connMock := s.makeConn(tt.data)
 			defer connMock.AssertExpectations(s.T())
 
-			hello, err := fake.ReadClientHello(
+			hello, _, err := fake.ReadClientHello(
 				connMock,
-				s.secret.Key[:],
+				[][]byte{s.secret.Key[:]},
 				s.secret.Host,
 				TolerateTime,
 			)
@@ -645,9 +645,9 @@ func (s *ParseClientHelloFragmentedTestSuite) TestReassemblyErrors() {
 			connMock := s.makeConn(tt.buildData())
 			defer connMock.AssertExpectations(s.T())
 
-			_, err := fake.ReadClientHello(
+			_, _, err := fake.ReadClientHello(
 				connMock,
-				s.secret.Key[:],
+				[][]byte{s.secret.Key[:]},
 				s.secret.Host,
 				TolerateTime,
 			)

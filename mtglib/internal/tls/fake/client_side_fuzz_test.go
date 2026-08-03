@@ -42,7 +42,7 @@ func FuzzReadClientHello(f *testing.F) {
 			Twice().
 			Return(nil)
 
-		_, err := fake.ReadClientHello(r, secret.Key[:], secret.Host, time.Hour)
+		_, _, err := fake.ReadClientHello(r, [][]byte{secret.Key[:]}, secret.Host, time.Hour)
 		assert.Error(t, err)
 	})
 }

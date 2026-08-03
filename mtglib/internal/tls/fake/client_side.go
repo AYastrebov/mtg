@@ -42,12 +42,22 @@ type ClientHello struct {
 	CipherSuite uint16
 }
 
+// ReadClientHello reads a FakeTLS ClientHello and authenticates it against a
+// list of candidate secrets, returning the index of the one that matched.
+//
+// A list rather than a single secret is what lets one proxy serve many clients
+// with individually revocable credentials. The cost is one HMAC per candidate,
+// over a message that is read exactly once; the hostname is checked before any
+// key is tried, so every secret in the list must share a fronting host.
+//
+// The index is -1 on every error path. ErrBadDigest specifically means "none of
+// these secrets", which is the signal the caller turns into domain fronting.
 func ReadClientHello(
 	conn net.Conn,
-	secret []byte,
+	secrets [][]byte,
 	hostname string,
 	tolerateTimeSkewness time.Duration,
-) (*ClientHello, error) {
+) (*ClientHello, int, error) {
 	// This is how FakeTLS is organized:
 	//  1. We create sha256 HMAC with a given secret
 	//  2. We dump there a whole TLS frame except of the fact that random
@@ -59,29 +69,58 @@ func ReadClientHello(
 	//     this message was created.
 	clientHelloCopy, handshakeReader, err := parseClientHello(conn)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read client hello: %w", err)
+		return nil, -1, fmt.Errorf("cannot read client hello: %w", err)
 	}
 
 	hello, err := parseHandshake(handshakeReader)
 	if err != nil {
-		return nil, fmt.Errorf("cannot parse handshake: %w", err)
+		return nil, -1, fmt.Errorf("cannot parse handshake: %w", err)
 	}
 
 	sniHostnames, err := parseSNI(handshakeReader)
 	if err != nil {
-		return nil, fmt.Errorf("cannot parse SNI: %w", err)
+		return nil, -1, fmt.Errorf("cannot parse SNI: %w", err)
 	}
 
 	if !slices.Contains(sniHostnames, hostname) {
-		return nil, fmt.Errorf("cannot find %s in %v", hostname, sniHostnames)
+		return nil, -1, fmt.Errorf("cannot find %s in %v", hostname, sniHostnames)
 	}
+
+	// The digest consumes the buffer, so hold the bytes: every candidate has to
+	// HMAC the same message.
+	clientHelloBytes := clientHelloCopy.Bytes()
+
+	for idx, secret := range secrets {
+		computed, ok := verifyDigest(clientHelloBytes, secret, hello)
+		if !ok {
+			continue
+		}
+
+		timestamp := int64(binary.LittleEndian.Uint32(computed[RandomLen-4:]))
+		createdAt := time.Unix(timestamp, 0)
+
+		if tdiff := time.Since(createdAt).Abs(); tdiff > tolerateTimeSkewness {
+			return nil, -1, fmt.Errorf("timestamp %q is too old %s", createdAt, tdiff)
+		}
+
+		return hello, idx, nil
+	}
+
+	return nil, -1, ErrBadDigest
+}
+
+// verifyDigest recomputes the FakeTLS HMAC for one candidate secret and reports
+// whether it authenticates the handshake, along with the digest the timestamp
+// is then read out of.
+func verifyDigest(clientHelloBytes []byte, secret []byte, hello *ClientHello) ([]byte, bool) {
+	buf := bytes.NewBuffer(clientHelloBytes)
 
 	digest := hmac.New(sha256.New, secret)
 	// we write a copy of the handshake with client random all nullified.
-	digest.Write(clientHelloCopy.Next(RandomOffset))
-	clientHelloCopy.Next(RandomLen)
+	digest.Write(buf.Next(RandomOffset))
+	buf.Next(RandomLen)
 	digest.Write(emptyRandom[:])
-	digest.Write(clientHelloCopy.Bytes())
+	digest.Write(buf.Bytes())
 
 	computed := digest.Sum(nil)
 
@@ -89,18 +128,7 @@ func ReadClientHello(
 		computed[i] ^= hello.Random[i]
 	}
 
-	if subtle.ConstantTimeCompare(emptyRandom[:RandomLen-4], computed[:RandomLen-4]) != 1 {
-		return nil, ErrBadDigest
-	}
-
-	timestamp := int64(binary.LittleEndian.Uint32(computed[RandomLen-4:]))
-	createdAt := time.Unix(timestamp, 0)
-
-	if tdiff := time.Since(createdAt).Abs(); tdiff > tolerateTimeSkewness {
-		return nil, fmt.Errorf("timestamp %q is too old %s", createdAt, tdiff)
-	}
-
-	return hello, nil
+	return computed, subtle.ConstantTimeCompare(emptyRandom[:RandomLen-4], computed[:RandomLen-4]) == 1
 }
 
 func parseHandshake(r io.Reader) (*ClientHello, error) {
