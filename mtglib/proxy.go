@@ -442,7 +442,13 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 
 	pool, err := ants.NewPoolWithFunc(opts.getConcurrency(),
 		func(arg any) {
-			proxy.ServeConn(arg.(poolTask).conn) //nolint: forcetypeassert
+			task := arg.(poolTask) //nolint: forcetypeassert
+
+			if task.web {
+				proxy.serveWebConn(task.conn, task.secretIdx)
+			} else {
+				proxy.ServeConn(task.conn)
+			}
 		},
 		ants.WithLogger(opts.getLogger("ants")),
 		ants.WithNonblocking(true))
