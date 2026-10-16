@@ -931,3 +931,103 @@ func TestSessionTouch(t *testing.T) {
 	h.s.touch(ts)
 	assert.Equal(t, ts, h.s.lastActivity())
 }
+
+func TestSessionDownlinkKeepsControlReserve(t *testing.T) {
+	h := newTestSession(t, nil)
+
+	_, err := h.s.processUp(1, batch(openFrame(7), openFrame(8)))
+	require.NoError(t, err)
+
+	limits := h.s.limits
+	reserve := limits.controlReserveBytes()
+
+	h.s.mu.Lock()
+	// Uplink pending is almost at the data partition limit.
+	h.s.pendingBytes[pendingUplink] = limits.MaxPendingPerSession - reserve - 100
+	h.s.mu.Unlock()
+
+	t.Cleanup(func() {
+		h.s.mu.Lock()
+		h.s.pendingBytes[pendingUplink] = 0
+		h.s.mu.Unlock()
+	})
+
+	// Stream 8 tries to push the whole control reserve downlink.
+	conn8 := h.serve.conn(t, 1)
+
+	go conn8.Write(make([]byte, reserve)) //nolint: errcheck
+
+	time.Sleep(50 * time.Millisecond)
+
+	_, total := dataFrames(h.s, 8)
+	assert.Zero(t, total, "downlink must not consume the control reserve")
+
+	require.NoError(t, h.serve.conn(t, 0).Close())
+
+	require.Eventually(t, func() bool { return hasFrame(h.s, FrameClose, 7) },
+		time.Second, time.Millisecond)
+	assert.False(t, isClosed(h.s))
+}
+
+func TestSessionClientCloseDropsDownlink(t *testing.T) {
+	h := newTestSession(t, nil)
+
+	_, err := h.s.processUp(1, openFrame(7))
+	require.NoError(t, err)
+
+	conn := h.serve.conn(t, 0)
+
+	_, err = conn.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	_, err = h.s.processUp(2, dataFrame(7, []byte("ab")))
+	require.NoError(t, err)
+	readN(t, conn, 2)
+
+	require.Eventually(t, func() bool {
+		_, total := dataFrames(h.s, 7)
+
+		return total == 5 && windowSum(h.s, 7) == 2
+	}, time.Second, time.Millisecond)
+
+	_, err = h.s.processUp(3, closeFrame(7))
+	require.NoError(t, err)
+
+	for _, f := range pendingFrames(h.s) {
+		assert.NotEqual(t, uint32(7), f.StreamID, "frame type 0x%02x left for a closed stream", byte(f.Type))
+	}
+
+	b, i := h.sink.totals()
+	assert.Equal(t, [3]int64{}, b)
+	assert.Equal(t, [3]int{}, i)
+
+	h.s.mu.Lock()
+	assert.Equal(t, [pendingClasses]int64{}, h.s.pendingBytes)
+	assert.Equal(t, [pendingClasses]int{}, h.s.pendingItems)
+	h.s.mu.Unlock()
+
+	assert.False(t, isClosed(h.s))
+}
+
+func TestSessionProxyCloseKeepsDownlink(t *testing.T) {
+	h := newTestSession(t, nil)
+
+	_, err := h.s.processUp(1, openFrame(7))
+	require.NoError(t, err)
+
+	conn := h.serve.conn(t, 0)
+
+	_, err = conn.Write([]byte("hello"))
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+
+	require.Eventually(t, func() bool { return hasFrame(h.s, FrameClose, 7) },
+		time.Second, time.Millisecond)
+
+	frames := pendingFrames(h.s)
+	require.Len(t, frames, 2)
+	assert.Equal(t, FrameData, frames[0].Type)
+	assert.Equal(t, "hello", string(frames[0].Payload))
+	assert.Equal(t, FrameClose, frames[1].Type)
+	assert.EqualValues(t, 7, frames[1].StreamID)
+}

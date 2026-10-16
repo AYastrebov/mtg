@@ -187,7 +187,7 @@ func (s *session) closeLocked() {
 	s.isClosed = true
 
 	for _, st := range s.streams {
-		s.closeStreamLocked(st, false)
+		s.closeStreamLocked(st, false, false) // the whole queue is dropped below
 	}
 
 	for class := range pendingClasses {
@@ -249,7 +249,9 @@ func (s *session) sessionAllowsLocked(class pendingClass, bytes int64, items int
 		return dataBytes+bytes <= s.limits.MaxPendingPerSession-s.limits.controlReserveBytes() &&
 			dataItems+items <= s.limits.MaxPendingItemsPerSession-s.limits.controlReserveItems()
 	case pendingDownlink:
-		return s.pendingBytes[pendingDownlink]+bytes <= s.downlinkBytesCap() &&
+		return dataBytes+bytes <= s.limits.MaxPendingPerSession-s.limits.controlReserveBytes() &&
+			dataItems+items <= s.limits.MaxPendingItemsPerSession-s.limits.controlReserveItems() &&
+			s.pendingBytes[pendingDownlink]+bytes <= s.downlinkBytesCap() &&
 			s.pendingItems[pendingDownlink]+items <= s.downlinkItemsCap()
 	}
 
@@ -452,7 +454,10 @@ func (s *session) addTombstoneLocked(id uint32) {
 
 // closeStreamLocked closes a stream pair, tombstones its id, releases its
 // budget and stream slot and, if sendClose, queues CLOSE to the client.
-func (s *session) closeStreamLocked(st *stream, sendClose bool) {
+// dropDownlink (a client CLOSE: an abort) also drops the stream's unsent
+// DATA and WINDOW items; on a proxy-side close they are kept, as those
+// bytes precede the CLOSE.
+func (s *session) closeStreamLocked(st *stream, sendClose, dropDownlink bool) {
 	if st.closed {
 		return
 	}
@@ -475,6 +480,10 @@ func (s *session) closeStreamLocked(st *stream, sendClose bool) {
 	s.releaseLocked(pendingUplink, queued, len(st.upQueue))
 	st.upQueue = nil
 
+	if dropDownlink {
+		s.dropStreamDownlinkLocked(st)
+	}
+
 	if st.acquired {
 		st.acquired = false
 		s.sink.releaseStream(s.profile.Index)
@@ -485,6 +494,27 @@ func (s *session) closeStreamLocked(st *stream, sendClose bool) {
 	if sendClose {
 		s.queueDownlinkLocked(Frame{Type: FrameClose, StreamID: st.id}, pendingControl)
 	}
+}
+
+// dropStreamDownlinkLocked removes the stream's unsent DATA and WINDOW
+// items from the pending queue and releases their budget.
+func (s *session) dropStreamDownlinkLocked(st *stream) {
+	kept := s.downlink[:0]
+
+	for _, it := range s.downlink {
+		if it.frame.StreamID == st.id && (it.frame.Type == FrameData || it.frame.Type == FrameWindow) {
+			it.sent = true
+			s.releaseLocked(it.class, it.bytes, it.items)
+
+			continue
+		}
+
+		kept = append(kept, it)
+	}
+
+	clear(s.downlink[len(kept):])
+	s.downlink = kept
+	st.pendingWindow = nil
 }
 
 // openStreamLocked admits a new stream. It returns nil if the stream was
@@ -535,7 +565,7 @@ func (s *session) startStream(st *stream) {
 		_ = st.proxySide.Close()
 
 		s.mu.Lock()
-		s.closeStreamLocked(st, true)
+		s.closeStreamLocked(st, true, false)
 		s.mu.Unlock()
 
 		return
@@ -599,7 +629,7 @@ func (s *session) uplinkPump(st *stream) {
 		}
 
 		if err != nil {
-			s.closeStreamLocked(st, true)
+			s.closeStreamLocked(st, true, false)
 			s.mu.Unlock()
 
 			return
@@ -627,7 +657,7 @@ func (s *session) downlinkPump(st *stream) {
 
 		if err != nil {
 			s.mu.Lock()
-			s.closeStreamLocked(st, true)
+			s.closeStreamLocked(st, true, false)
 			s.mu.Unlock()
 
 			return
@@ -912,7 +942,7 @@ func (s *session) applyLocked(frames []Frame, charged []bool) []*stream {
 			wake(st.downWake)
 		case FrameClose:
 			if st != nil {
-				s.closeStreamLocked(st, false)
+				s.closeStreamLocked(st, false, true)
 			}
 		}
 	}
