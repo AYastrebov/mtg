@@ -1,11 +1,13 @@
 package web
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -74,13 +76,48 @@ func TestScannerFindsSecrets(t *testing.T) {
 		})
 	}
 
-	t.Run("header name", func(t *testing.T) {
+	t.Run("header name after canonicalization", func(t *testing.T) {
+		t.Parallel()
+
+		// net/http canonicalizes header names (textproto), which destroys
+		// the case of base64, so a token used as a header name is not
+		// recoverable. The same token as a value is detected.
+		asName := "GET / HTTP/1.1\r\nHost: example.com\r\n" + tok + ": 1\r\n\r\n"
+		r, err := http.ReadRequest(bufio.NewReader(strings.NewReader(asName)))
+		require.NoError(t, err)
+		assert.False(t, scanner.requestCarriesSecret(r))
+
+		asValue := "GET / HTTP/1.1\r\nHost: example.com\r\nX-Foo: " + tok + "\r\n\r\n"
+		r, err = http.ReadRequest(bufio.NewReader(strings.NewReader(asValue)))
+		require.NoError(t, err)
+		assert.True(t, scanner.requestCarriesSecret(r))
+	})
+
+	t.Run("header name verbatim", func(t *testing.T) {
 		t.Parallel()
 
 		r := httptest.NewRequest(http.MethodGet, "/", nil)
 		r.Header[tok] = []string{"1"}
 
 		assert.True(t, scanner.requestCarriesSecret(r))
+	})
+
+	t.Run("malformed escape before encoded token", func(t *testing.T) {
+		t.Parallel()
+
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.Header.Set("X-Foo", "%zz"+percentEncodeAll(tok))
+
+		assert.True(t, scanner.requestCarriesSecret(r))
+	})
+
+	t.Run("malformed escape alone", func(t *testing.T) {
+		t.Parallel()
+
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.Header.Set("X-Foo", "%zz")
+
+		assert.False(t, scanner.requestCarriesSecret(r))
 	})
 
 	t.Run("second header value", func(t *testing.T) {
