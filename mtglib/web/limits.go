@@ -1,0 +1,239 @@
+package web
+
+import (
+	"errors"
+	"fmt"
+	"time"
+)
+
+const (
+	// queueItemCost is a fixed accounting overhead of a queued item.
+	queueItemCost = 256
+
+	minCarrierBatchBytes = 256 << 10
+	maxCarrierBatchBytes = 2 << 20
+	maxFramePayloadLimit = 1 << 20
+)
+
+// ErrLimits is returned when Limits are inconsistent.
+var ErrLimits = errors.New("invalid web limits")
+
+// Limits are global resource limits of WEB proxy.
+type Limits struct {
+	MaxSessions          int
+	MaxSessionsPerIP     int
+	MaxStreams           int
+	MaxStreamsPerSession int
+
+	NewSessionsPerMinute int
+	NewSessionsBurst     int
+	NewStreamsPerMinute  int
+	NewStreamsBurst      int
+
+	MaxBootstraps          int
+	MaxBootstrapsPerIP     int
+	NewBootstrapsPerMinute int
+	NewBootstrapsBurst     int
+
+	MaxPendingPerSession int64
+	MaxPendingGlobal     int64
+
+	MaxPendingItemsPerSession int
+	MaxPendingItemsGlobal     int
+
+	CarrierBatchBytes  int
+	MaxBodyBytes       int
+	MaxFramePayload    int
+	MaxClosedStreamIDs int
+}
+
+// DefaultLimits returns the default limits.
+func DefaultLimits() Limits {
+	return Limits{
+		MaxSessions:          128,
+		MaxSessionsPerIP:     0,
+		MaxStreams:           4096,
+		MaxStreamsPerSession: 128,
+
+		NewSessionsPerMinute: 600,
+		NewSessionsBurst:     128,
+		NewStreamsPerMinute:  6000,
+		NewStreamsBurst:      512,
+
+		MaxBootstraps:          512,
+		MaxBootstrapsPerIP:     0,
+		NewBootstrapsPerMinute: 1200,
+		NewBootstrapsBurst:     256,
+
+		MaxPendingPerSession: 32 << 20,
+		MaxPendingGlobal:     512 << 20,
+
+		MaxPendingItemsPerSession: 16384,
+		MaxPendingItemsGlobal:     262144,
+
+		CarrierBatchBytes:  2 << 20,
+		MaxBodyBytes:       2 << 20,
+		MaxFramePayload:    1 << 20,
+		MaxClosedStreamIDs: 4096,
+	}
+}
+
+// ProfileLimits are per-profile overrides. Zero means "inherit global";
+// values may only lower the global limit.
+type ProfileLimits struct {
+	MaxSessions          int
+	MaxStreams           int
+	MaxStreamsPerSession int
+
+	NewSessionsPerMinute int
+	NewSessionsBurst     int
+	NewStreamsPerMinute  int
+	NewStreamsBurst      int
+
+	MaxPendingPerSession int64
+}
+
+// Timeouts are time-related settings of WEB proxy.
+type Timeouts struct {
+	LongPoll          time.Duration
+	ReconnectGrace    time.Duration
+	BootstrapLifetime time.Duration
+	Shutdown          time.Duration
+}
+
+// DefaultTimeouts returns the default timeouts.
+func DefaultTimeouts() Timeouts {
+	return Timeouts{
+		LongPoll:          25 * time.Second,
+		ReconnectGrace:    2 * time.Minute,
+		BootstrapLifetime: 2 * time.Minute,
+		Shutdown:          15 * time.Second,
+	}
+}
+
+func (l Limits) controlReserveItems() int {
+	return 16 + 3*l.MaxStreamsPerSession
+}
+
+func (l Limits) controlReserveBytes() int64 {
+	return int64(l.controlReserveItems()) * (queueItemCost + FrameHeaderSize + 4)
+}
+
+func (l Limits) uplinkReserveBytes() int64 {
+	return int64(l.MaxBodyBytes) + int64(min(l.MaxBodyBytes/8, 4096))*queueItemCost
+}
+
+func (l Limits) validate() error {
+	positive := []struct {
+		name  string
+		value int64
+	}{
+		{"MaxSessions", int64(l.MaxSessions)},
+		{"MaxStreams", int64(l.MaxStreams)},
+		{"MaxStreamsPerSession", int64(l.MaxStreamsPerSession)},
+		{"NewSessionsPerMinute", int64(l.NewSessionsPerMinute)},
+		{"NewSessionsBurst", int64(l.NewSessionsBurst)},
+		{"NewStreamsPerMinute", int64(l.NewStreamsPerMinute)},
+		{"NewStreamsBurst", int64(l.NewStreamsBurst)},
+		{"MaxBootstraps", int64(l.MaxBootstraps)},
+		{"NewBootstrapsPerMinute", int64(l.NewBootstrapsPerMinute)},
+		{"NewBootstrapsBurst", int64(l.NewBootstrapsBurst)},
+		{"MaxPendingPerSession", l.MaxPendingPerSession},
+		{"MaxPendingGlobal", l.MaxPendingGlobal},
+		{"MaxPendingItemsPerSession", int64(l.MaxPendingItemsPerSession)},
+		{"MaxPendingItemsGlobal", int64(l.MaxPendingItemsGlobal)},
+		{"MaxBodyBytes", int64(l.MaxBodyBytes)},
+		{"MaxClosedStreamIDs", int64(l.MaxClosedStreamIDs)},
+	}
+	for _, p := range positive {
+		if p.value <= 0 {
+			return fmt.Errorf("%w: %s must be positive, got %d", ErrLimits, p.name, p.value)
+		}
+	}
+
+	if l.MaxSessionsPerIP < 0 {
+		return fmt.Errorf("%w: MaxSessionsPerIP must not be negative", ErrLimits)
+	}
+
+	if l.MaxBootstrapsPerIP < 0 {
+		return fmt.Errorf("%w: MaxBootstrapsPerIP must not be negative", ErrLimits)
+	}
+
+	maxBatch := min(l.MaxBodyBytes, maxCarrierBatchBytes)
+	if l.CarrierBatchBytes < minCarrierBatchBytes || l.CarrierBatchBytes > maxBatch {
+		return fmt.Errorf("%w: CarrierBatchBytes %d is out of [%d, %d]",
+			ErrLimits, l.CarrierBatchBytes, minCarrierBatchBytes, maxBatch)
+	}
+
+	if l.MaxFramePayload <= 0 || l.MaxFramePayload > maxFramePayloadLimit {
+		return fmt.Errorf("%w: MaxFramePayload %d is out of (0, %d]",
+			ErrLimits, l.MaxFramePayload, maxFramePayloadLimit)
+	}
+
+	if l.controlReserveBytes()*int64(l.MaxSessions) >= l.MaxPendingGlobal {
+		return fmt.Errorf("%w: control reserve of MaxSessions exhausts MaxPendingGlobal", ErrLimits)
+	}
+
+	if l.controlReserveItems()*l.MaxSessions >= l.MaxPendingItemsGlobal {
+		return fmt.Errorf("%w: control reserve of MaxSessions exhausts MaxPendingItemsGlobal", ErrLimits)
+	}
+
+	return nil
+}
+
+// merge applies profile overrides. Profile values may only lower global
+// limits; zero and higher values are ignored.
+func (l Limits) merge(p ProfileLimits) Limits {
+	lower := func(dst *int, v int) {
+		if v > 0 && v < *dst {
+			*dst = v
+		}
+	}
+
+	lower(&l.MaxSessions, p.MaxSessions)
+	lower(&l.MaxStreams, p.MaxStreams)
+	lower(&l.MaxStreamsPerSession, p.MaxStreamsPerSession)
+	lower(&l.NewSessionsPerMinute, p.NewSessionsPerMinute)
+	lower(&l.NewSessionsBurst, p.NewSessionsBurst)
+	lower(&l.NewStreamsPerMinute, p.NewStreamsPerMinute)
+	lower(&l.NewStreamsBurst, p.NewStreamsBurst)
+
+	if p.MaxPendingPerSession > 0 && p.MaxPendingPerSession < l.MaxPendingPerSession {
+		l.MaxPendingPerSession = p.MaxPendingPerSession
+	}
+
+	return l
+}
+
+// rateBucket is a token bucket. It is NOT safe for concurrent use: the
+// owner (the manager) must guard it with its own mutex.
+type rateBucket struct {
+	perMinute float64
+	burst     float64
+	tokens    float64
+	last      time.Time
+}
+
+func newRateBucket(perMinute, burst int, now time.Time) *rateBucket {
+	return &rateBucket{
+		perMinute: float64(perMinute),
+		burst:     float64(burst),
+		tokens:    float64(burst),
+		last:      now,
+	}
+}
+
+func (b *rateBucket) take(now time.Time) bool {
+	if elapsed := now.Sub(b.last); elapsed > 0 {
+		b.tokens = min(b.burst, b.tokens+b.perMinute*elapsed.Minutes())
+		b.last = now
+	}
+
+	if b.tokens < 1 {
+		return false
+	}
+
+	b.tokens--
+
+	return true
+}

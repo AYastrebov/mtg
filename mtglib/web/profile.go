@@ -31,6 +31,8 @@ type Profile struct {
 	// (0 for a single secret).
 	Index  int
 	Secret mtglib.Secret
+	// Limits are per-profile overrides; zero value = inherit the global Limits.
+	Limits ProfileLimits
 }
 
 // ValidateHostname checks that h is a lowercase ASCII DNS name without a
