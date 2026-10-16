@@ -1,0 +1,921 @@
+package web
+
+import (
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"math"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/9seconds/mtg/v2/essentials"
+	"github.com/9seconds/mtg/v2/mtglib"
+)
+
+// downlinkRetryInterval is how often a downlink pump retries queueing data
+// that the global budget refused. Session-local releases wake pumps
+// immediately; releases in other sessions are only noticed by this timer.
+const downlinkRetryInterval = 50 * time.Millisecond
+
+// serveFunc hands a proxy-facing stream end to mtglib. It must not block
+// for the lifetime of the stream.
+type serveFunc func(conn essentials.Conn, secretIdx int) error
+
+// pendingClass is an accounting class of queued items.
+type pendingClass int
+
+const (
+	pendingControl pendingClass = iota
+	pendingUplink
+	pendingDownlink
+
+	pendingClasses = 3
+)
+
+// budgetSink is a global budget (implemented by the manager). Sessions call
+// it while holding their own mutex: an implementation must never call back
+// into a session while holding its own lock.
+type budgetSink interface {
+	// changePending applies a delta; false means refused and nothing changed.
+	// Negative deltas (releases) are never refused.
+	changePending(class pendingClass, bytes int64, items int) bool
+	acquireStream(profileIdx int, now time.Time) bool
+	releaseStream(profileIdx int)
+}
+
+var (
+	errSessionProtocol = errors.New("web session protocol violation")
+	errBackpressure    = errors.New("web session backpressure")
+	errConcurrent      = errors.New("concurrent uplink request")
+	errSessionClosed   = errors.New("web session is closed")
+)
+
+// downItem is a queued downlink frame. Its payload is owned by the queue.
+type downItem struct {
+	frame Frame
+	class pendingClass
+	// bytes and items are what this item holds against the budgets.
+	bytes int64
+	items int
+	// sent is set once the item left the pending queue (taken into a
+	// batch); a sent item is never coalesced into.
+	sent bool
+}
+
+type stream struct {
+	id          uint32
+	proxySide   essentials.Conn
+	sessionSide net.Conn
+	acquired    bool
+	closed      bool
+	done        chan struct{}
+
+	// upQueue are client DATA payloads not yet written to sessionSide.
+	upQueue [][]byte
+	upWake  chan struct{}
+
+	downWake chan struct{}
+
+	// receiveWindow is how many bytes the client may still send to us.
+	receiveWindow int64
+	// sendCredit is how many bytes we may still send to the client.
+	sendCredit int64
+
+	// pendingWindow is this stream's WINDOW item still in the pending
+	// queue, if any; further grants are summed into it.
+	pendingWindow *downItem
+}
+
+// session is a single WEB proxy session. One mutex guards all session and
+// stream state; per-stream pumps are goroutines that never hold it while
+// doing I/O.
+type session struct {
+	mu sync.Mutex
+
+	profile  *Profile
+	limits   Limits
+	sink     budgetSink
+	serve    serveFunc
+	clientIP net.IP
+	logger   mtglib.Logger
+	now      func() time.Time
+
+	streams    map[uint32]*stream
+	tombstones map[uint32]struct{}
+	tombRing   []uint32
+	tombNext   int
+
+	pendingBytes [pendingClasses]int64
+	pendingItems [pendingClasses]int
+
+	// downlink is the ordered queue of frames not yet taken into a batch.
+	downlink []*downItem
+	// downlinkNotify is signalled whenever something is queued.
+	downlinkNotify chan struct{}
+
+	lastSeq    uint64
+	lastDigest [sha256.Size]byte
+	upBusy     bool
+
+	isClosed bool
+	done     chan struct{}
+	activity time.Time
+
+	wg sync.WaitGroup
+}
+
+func newSession(profile *Profile, limits Limits, sink budgetSink, serve serveFunc,
+	clientIP net.IP, logger mtglib.Logger, now func() time.Time,
+) *session {
+	limits = limits.merge(profile.Limits)
+
+	return &session{
+		profile:        profile,
+		limits:         limits,
+		sink:           sink,
+		serve:          serve,
+		clientIP:       append(net.IP(nil), clientIP...),
+		logger:         logger.Named("web-session").BindInt("profile", profile.Index),
+		now:            now,
+		streams:        map[uint32]*stream{},
+		tombstones:     map[uint32]struct{}{},
+		tombRing:       make([]uint32, 0, min(limits.MaxClosedStreamIDs, 64)),
+		downlinkNotify: make(chan struct{}, 1),
+		done:           make(chan struct{}),
+		activity:       now(),
+	}
+}
+
+func (s *session) closed() <-chan struct{} {
+	return s.done
+}
+
+func (s *session) touch(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.activity = now
+}
+
+func (s *session) lastActivity() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.activity
+}
+
+// wait blocks until every pump goroutine has exited. Call after close.
+func (s *session) wait() {
+	s.wg.Wait()
+}
+
+// close is idempotent: it closes every stream pair, releases every budget
+// the session holds and stops the pumps.
+func (s *session) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.closeLocked()
+}
+
+func (s *session) closeLocked() {
+	if s.isClosed {
+		return
+	}
+
+	s.isClosed = true
+
+	for _, st := range s.streams {
+		s.closeStreamLocked(st, false)
+	}
+
+	for class := range pendingClasses {
+		if s.pendingBytes[class] != 0 || s.pendingItems[class] != 0 {
+			s.sink.changePending(pendingClass(class), -s.pendingBytes[class], -s.pendingItems[class])
+		}
+
+		s.pendingBytes[class] = 0
+		s.pendingItems[class] = 0
+	}
+
+	for _, it := range s.downlink {
+		it.sent = true
+	}
+
+	s.downlink = nil
+
+	close(s.done)
+	s.logger.Debug("session closed")
+}
+
+// --- budgets ---------------------------------------------------------------
+
+func (s *session) uplinkReserveItems() int {
+	return min(s.limits.MaxBodyBytes/8, 4096) //nolint: mnd
+}
+
+func (s *session) totalPendingLocked() (int64, int) {
+	var (
+		bytes int64
+		items int
+	)
+
+	for class := range pendingClasses {
+		bytes += s.pendingBytes[class]
+		items += s.pendingItems[class]
+	}
+
+	return bytes, items
+}
+
+// sessionAllowsLocked checks per-session partitions. Control may use the
+// whole session budget; data classes leave the control reserve intact, and
+// downlink additionally leaves the uplink reserve.
+func (s *session) sessionAllowsLocked(class pendingClass, bytes int64, items int) bool {
+	totalBytes, totalItems := s.totalPendingLocked()
+	if totalBytes+bytes > s.limits.MaxPendingPerSession ||
+		totalItems+items > s.limits.MaxPendingItemsPerSession {
+		return false
+	}
+
+	dataBytes := s.pendingBytes[pendingUplink] + s.pendingBytes[pendingDownlink]
+	dataItems := s.pendingItems[pendingUplink] + s.pendingItems[pendingDownlink]
+
+	switch class {
+	case pendingControl:
+		return true
+	case pendingUplink:
+		return dataBytes+bytes <= s.limits.MaxPendingPerSession-s.limits.controlReserveBytes() &&
+			dataItems+items <= s.limits.MaxPendingItemsPerSession-s.limits.controlReserveItems()
+	case pendingDownlink:
+		return s.pendingBytes[pendingDownlink]+bytes <= s.downlinkBytesCap() &&
+			s.pendingItems[pendingDownlink]+items <= s.downlinkItemsCap()
+	}
+
+	return false
+}
+
+func (s *session) downlinkBytesCap() int64 {
+	return s.limits.MaxPendingPerSession - s.limits.controlReserveBytes() - s.limits.uplinkReserveBytes()
+}
+
+func (s *session) downlinkItemsCap() int {
+	return s.limits.MaxPendingItemsPerSession - s.limits.controlReserveItems() - s.uplinkReserveItems()
+}
+
+// downlinkHeadroomLocked is how many payload bytes a new downlink DATA item
+// may carry right now.
+func (s *session) downlinkHeadroomLocked() int64 {
+	if s.pendingItems[pendingDownlink] >= s.downlinkItemsCap() {
+		return 0
+	}
+
+	return max(0, s.downlinkBytesCap()-s.pendingBytes[pendingDownlink]-queueItemCost-FrameHeaderSize)
+}
+
+func (s *session) chargeLocked(class pendingClass, bytes int64, items int) bool {
+	if !s.sessionAllowsLocked(class, bytes, items) {
+		return false
+	}
+
+	if !s.sink.changePending(class, bytes, items) {
+		return false
+	}
+
+	s.pendingBytes[class] += bytes
+	s.pendingItems[class] += items
+
+	return true
+}
+
+func (s *session) releaseLocked(class pendingClass, bytes int64, items int) {
+	if s.isClosed || (bytes == 0 && items == 0) {
+		return // everything was released in bulk by closeLocked
+	}
+
+	s.pendingBytes[class] -= bytes
+	s.pendingItems[class] -= items
+	s.sink.changePending(class, -bytes, -items)
+}
+
+// releaseDownlink releases budget of downlink items that were delivered
+// (acknowledged by the client) and wakes downlink pumps.
+func (s *session) releaseDownlink(class pendingClass, bytes int64, items int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.releaseLocked(class, bytes, items)
+
+	for _, st := range s.streams {
+		wake(st.downWake)
+	}
+}
+
+// popDownlinkLocked removes the first n pending items. The caller keeps
+// them (and their budget) until they are acknowledged.
+func (s *session) popDownlinkLocked(n int) []*downItem {
+	n = min(n, len(s.downlink))
+	items := make([]*downItem, n)
+	copy(items, s.downlink[:n])
+
+	for i := range n {
+		s.downlink[i] = nil
+		items[i].sent = true
+
+		if st := s.streams[items[i].frame.StreamID]; st != nil && st.pendingWindow == items[i] {
+			st.pendingWindow = nil
+		}
+	}
+
+	s.downlink = s.downlink[n:]
+
+	return items
+}
+
+// --- downlink queue --------------------------------------------------------
+
+// queueDownlink queues a frame for the client. For control frames a refusal
+// closes the session.
+func (s *session) queueDownlink(f Frame, class pendingClass) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.queueDownlinkLocked(f, class)
+}
+
+func (s *session) queueDownlinkLocked(f Frame, class pendingClass) bool {
+	if s.isClosed {
+		return false
+	}
+
+	if s.coalesceLocked(f) {
+		return true
+	}
+
+	size := int64(len(f.Payload))
+	if !s.chargeLocked(class, size+queueItemCost, 1) {
+		if class == pendingControl {
+			s.logger.Warning("control frame refused by budget, closing session")
+			s.closeLocked()
+		}
+
+		return false
+	}
+
+	it := &downItem{
+		frame: Frame{
+			Type:     f.Type,
+			StreamID: f.StreamID,
+			Payload:  append([]byte(nil), f.Payload...),
+		},
+		class: class,
+		bytes: size + queueItemCost,
+		items: 1,
+	}
+	s.downlink = append(s.downlink, it)
+
+	if f.Type == FrameWindow {
+		if st := s.streams[f.StreamID]; st != nil {
+			st.pendingWindow = it
+		}
+	}
+
+	wake(s.downlinkNotify)
+
+	return true
+}
+
+// coalesceLocked merges f into an existing pending item: WINDOW into the
+// stream's pending WINDOW (sum), DATA into the last queued item if it is
+// DATA of the same stream (up to MaxFramePayload).
+func (s *session) coalesceLocked(f Frame) bool {
+	switch f.Type { //nolint: exhaustive
+	case FrameWindow:
+		st := s.streams[f.StreamID]
+		if st == nil || st.pendingWindow == nil || st.pendingWindow.sent {
+			return false
+		}
+
+		add, err := WindowAmount(f.Payload)
+		if err != nil {
+			return false
+		}
+
+		cur, _ := WindowAmount(st.pendingWindow.frame.Payload)
+		sum := min(uint64(cur)+uint64(add), math.MaxUint32)
+		st.pendingWindow.frame.Payload = WindowPayload(uint32(sum)) //nolint: gosec
+
+		return true
+	case FrameData:
+		if len(s.downlink) == 0 {
+			return false
+		}
+
+		last := s.downlink[len(s.downlink)-1]
+		if last.sent || last.frame.Type != FrameData || last.frame.StreamID != f.StreamID ||
+			len(last.frame.Payload)+len(f.Payload) > MaxFramePayload {
+			return false
+		}
+
+		if !s.chargeLocked(last.class, int64(len(f.Payload)), 0) {
+			return false
+		}
+
+		last.frame.Payload = append(last.frame.Payload, f.Payload...)
+		last.bytes += int64(len(f.Payload))
+		wake(s.downlinkNotify)
+
+		return true
+	}
+
+	return false
+}
+
+// --- streams ---------------------------------------------------------------
+
+func (s *session) addTombstoneLocked(id uint32) {
+	if _, ok := s.tombstones[id]; ok {
+		return
+	}
+
+	if len(s.tombRing) < s.limits.MaxClosedStreamIDs {
+		s.tombRing = append(s.tombRing, id)
+	} else {
+		delete(s.tombstones, s.tombRing[s.tombNext])
+		s.tombRing[s.tombNext] = id
+		s.tombNext = (s.tombNext + 1) % len(s.tombRing)
+	}
+
+	s.tombstones[id] = struct{}{}
+}
+
+// closeStreamLocked closes a stream pair, tombstones its id, releases its
+// budget and stream slot and, if sendClose, queues CLOSE to the client.
+func (s *session) closeStreamLocked(st *stream, sendClose bool) {
+	if st.closed {
+		return
+	}
+
+	st.closed = true
+	close(st.done)
+
+	// Closing our end only: the proxy side then reads a clean io.EOF and
+	// its writes fail; the relay closes the proxy side itself.
+	_ = st.sessionSide.Close()
+
+	delete(s.streams, st.id)
+	s.addTombstoneLocked(st.id)
+
+	var queued int64
+	for _, chunk := range st.upQueue {
+		queued += int64(len(chunk)) + queueItemCost
+	}
+
+	s.releaseLocked(pendingUplink, queued, len(st.upQueue))
+	st.upQueue = nil
+
+	if st.acquired {
+		st.acquired = false
+		s.sink.releaseStream(s.profile.Index)
+	}
+
+	s.logger.BindInt("stream", int(st.id)).Debug("stream closed")
+
+	if sendClose {
+		s.queueDownlinkLocked(Frame{Type: FrameClose, StreamID: st.id}, pendingControl)
+	}
+}
+
+// openStreamLocked admits a new stream. It returns nil if the stream was
+// refused (the id is tombstoned and CLOSE is queued).
+func (s *session) openStreamLocked(id uint32) *stream {
+	if len(s.streams) >= s.limits.MaxStreamsPerSession ||
+		!s.sink.acquireStream(s.profile.Index, s.now()) {
+		s.logger.BindInt("stream", int(id)).Debug("stream refused by limits")
+		s.addTombstoneLocked(id)
+		s.queueDownlinkLocked(Frame{Type: FrameClose, StreamID: id}, pendingControl)
+
+		return nil
+	}
+
+	proxySide, sessionSide := newStreamPair(s.clientIP)
+	st := &stream{
+		id:            id,
+		proxySide:     proxySide,
+		sessionSide:   sessionSide,
+		acquired:      true,
+		done:          make(chan struct{}),
+		upWake:        make(chan struct{}, 1),
+		downWake:      make(chan struct{}, 1),
+		receiveWindow: InitialStreamWindow,
+		sendCredit:    InitialStreamWindow,
+	}
+	s.streams[id] = st
+
+	return st
+}
+
+// startStream hands the proxy side to serve (without the session lock) and
+// starts the pumps on success.
+func (s *session) startStream(st *stream) {
+	log := s.logger.BindInt("stream", int(st.id))
+
+	s.mu.Lock()
+	alreadyClosed := st.closed
+	s.mu.Unlock()
+
+	if alreadyClosed {
+		return
+	}
+
+	if err := s.serve(st.proxySide, s.profile.Index); err != nil {
+		log.DebugError("cannot serve stream", err)
+
+		_ = st.proxySide.Close()
+
+		s.mu.Lock()
+		s.closeStreamLocked(st, true)
+		s.mu.Unlock()
+
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if st.closed || s.isClosed {
+		return
+	}
+
+	log.Debug("stream opened")
+	s.wg.Add(2) //nolint: mnd
+
+	go s.uplinkPump(st)
+	go s.downlinkPump(st)
+}
+
+func (s *session) uplinkPump(st *stream) {
+	defer s.wg.Done()
+
+	for {
+		s.mu.Lock()
+
+		for len(st.upQueue) == 0 {
+			if st.closed || s.isClosed {
+				s.mu.Unlock()
+
+				return
+			}
+
+			s.mu.Unlock()
+
+			select {
+			case <-st.upWake:
+			case <-st.done:
+			}
+
+			s.mu.Lock()
+		}
+
+		chunk := st.upQueue[0]
+		st.upQueue[0] = nil
+		st.upQueue = st.upQueue[1:]
+
+		s.mu.Unlock()
+
+		n, err := st.sessionSide.Write(chunk)
+
+		s.mu.Lock()
+		s.releaseLocked(pendingUplink, int64(len(chunk))+queueItemCost, 1)
+
+		if n > 0 && !st.closed {
+			st.receiveWindow += int64(n)
+			s.queueDownlinkLocked(Frame{
+				Type:     FrameWindow,
+				StreamID: st.id,
+				Payload:  WindowPayload(uint32(n)), //nolint: gosec
+			}, pendingControl)
+		}
+
+		if err != nil {
+			s.closeStreamLocked(st, true)
+			s.mu.Unlock()
+
+			return
+		}
+
+		s.mu.Unlock()
+	}
+}
+
+func (s *session) downlinkPump(st *stream) {
+	defer s.wg.Done()
+
+	buf := make([]byte, DataChunk)
+
+	for {
+		allowance, ok := s.downlinkAllowance(st)
+		if !ok {
+			return
+		}
+
+		k, err := st.sessionSide.Read(buf[:allowance])
+		if k > 0 && !s.queueStreamData(st, buf[:k]) {
+			return
+		}
+
+		if err != nil {
+			s.mu.Lock()
+			s.closeStreamLocked(st, true)
+			s.mu.Unlock()
+
+			return
+		}
+	}
+}
+
+// downlinkAllowance blocks until the stream may read something; false if
+// the stream or session is closed.
+func (s *session) downlinkAllowance(st *stream) (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for {
+		if st.closed || s.isClosed {
+			return 0, false
+		}
+
+		allowance := min(st.sendCredit, DataChunk, s.downlinkHeadroomLocked())
+		if allowance > 0 {
+			return int(allowance), true
+		}
+
+		s.mu.Unlock()
+
+		select {
+		case <-st.downWake:
+		case <-st.done:
+		}
+
+		s.mu.Lock()
+	}
+}
+
+// queueStreamData queues data read from a stream, waiting while budgets
+// refuse it. false if the stream or session is closed.
+func (s *session) queueStreamData(st *stream, data []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for {
+		if st.closed || s.isClosed {
+			return false
+		}
+
+		if s.queueDownlinkLocked(Frame{Type: FrameData, StreamID: st.id, Payload: data}, pendingDownlink) {
+			st.sendCredit -= int64(len(data))
+
+			return true
+		}
+
+		s.mu.Unlock()
+
+		timer := time.NewTimer(downlinkRetryInterval)
+
+		select {
+		case <-st.downWake:
+		case <-st.done:
+		case <-timer.C:
+		}
+
+		timer.Stop()
+		s.mu.Lock()
+	}
+}
+
+func wake(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// --- uplink ----------------------------------------------------------------
+
+type simStream struct {
+	live   bool
+	window int64
+}
+
+// processUp applies one uplink batch. It returns the acknowledged sequence
+// number.
+func (s *session) processUp(seq uint64, body []byte) (uint64, error) {
+	s.mu.Lock()
+
+	if s.isClosed {
+		s.mu.Unlock()
+
+		return 0, errSessionClosed
+	}
+
+	if s.upBusy {
+		s.mu.Unlock()
+
+		return 0, errConcurrent
+	}
+
+	digest := sha256.Sum256(body)
+
+	switch {
+	case seq == 0:
+		return 0, s.protocolErrorLocked("zero sequence")
+	case seq == s.lastSeq:
+		if digest != s.lastDigest {
+			return 0, s.protocolErrorLocked("retry with a different body")
+		}
+
+		s.mu.Unlock()
+
+		return seq, nil
+	case seq != s.lastSeq+1:
+		return 0, s.protocolErrorLocked("unexpected sequence")
+	}
+
+	frames, err := ParseFrames(body, s.limits.MaxFramePayload)
+	if err != nil {
+		return 0, s.protocolErrorLocked("cannot parse batch")
+	}
+
+	charged, upBytes, upItems, err := s.validateLocked(frames)
+	if err != nil {
+		return 0, s.protocolErrorLocked(err.Error())
+	}
+
+	if upItems > 0 && !s.chargeLocked(pendingUplink, upBytes, upItems) {
+		s.mu.Unlock()
+
+		return 0, errBackpressure
+	}
+
+	s.upBusy = true
+	s.lastSeq = seq
+	s.lastDigest = digest
+
+	toStart := s.applyLocked(frames, charged)
+	s.mu.Unlock()
+
+	for _, st := range toStart {
+		s.startStream(st)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.upBusy = false
+
+	if s.isClosed {
+		return 0, errSessionClosed
+	}
+
+	return seq, nil
+}
+
+// protocolErrorLocked closes the session and unlocks the mutex.
+func (s *session) protocolErrorLocked(reason string) error {
+	s.logger.Info("protocol violation: " + reason)
+	s.closeLocked()
+	s.mu.Unlock()
+
+	return fmt.Errorf("%w: %s", errSessionProtocol, reason)
+}
+
+// validateLocked checks the whole batch against a snapshot of the stream
+// state, without side effects. It returns the uplink budget the batch needs
+// and which frames (DATA to a live stream) it is charged for.
+func (s *session) validateLocked(frames []Frame) ([]bool, int64, int, error) { //nolint: cyclop
+	sim := map[uint32]*simStream{}
+	lookup := func(id uint32) *simStream {
+		if v, ok := sim[id]; ok {
+			return v
+		}
+
+		if st := s.streams[id]; st != nil {
+			v := &simStream{live: true, window: st.receiveWindow}
+			sim[id] = v
+
+			return v
+		}
+
+		if _, ok := s.tombstones[id]; ok {
+			v := &simStream{}
+			sim[id] = v
+
+			return v
+		}
+
+		return nil
+	}
+
+	var (
+		upBytes int64
+		upItems int
+		charged = make([]bool, len(frames))
+	)
+
+	for i, f := range frames {
+		if err := f.ValidateClientShape(); err != nil {
+			return nil, 0, 0, fmt.Errorf("bad frame shape type=0x%02x id=%d", byte(f.Type), f.StreamID)
+		}
+
+		if f.Type == FramePong {
+			continue
+		}
+
+		st := lookup(f.StreamID)
+
+		switch f.Type { //nolint: exhaustive
+		case FrameOpen:
+			if st != nil {
+				return nil, 0, 0, fmt.Errorf("OPEN on used id %d", f.StreamID)
+			}
+
+			sim[f.StreamID] = &simStream{live: true, window: InitialStreamWindow}
+
+			continue
+		}
+
+		if st == nil {
+			return nil, 0, 0, fmt.Errorf("frame type=0x%02x on unknown id %d", byte(f.Type), f.StreamID)
+		}
+
+		if !st.live {
+			continue
+		}
+
+		switch f.Type { //nolint: exhaustive
+		case FrameData:
+			n := int64(len(f.Payload))
+			if n > st.window {
+				return nil, 0, 0, fmt.Errorf("receive window exceeded on id %d", f.StreamID)
+			}
+
+			st.window -= n
+			upBytes += n + queueItemCost
+			upItems++
+			charged[i] = true
+		case FrameClose:
+			st.live = false
+		}
+	}
+
+	return charged, upBytes, upItems, nil
+}
+
+// applyLocked applies a validated and budgeted batch. It returns streams
+// that must be handed to serve once the lock is released.
+func (s *session) applyLocked(frames []Frame, charged []bool) []*stream {
+	var toStart []*stream
+
+	for i, f := range frames {
+		if s.isClosed {
+			break
+		}
+
+		st := s.streams[f.StreamID]
+
+		switch f.Type { //nolint: exhaustive
+		case FrameOpen:
+			if st := s.openStreamLocked(f.StreamID); st != nil {
+				toStart = append(toStart, st)
+			}
+		case FrameData:
+			if st == nil {
+				// tombstoned, or refused at OPEN: drop and give back budget.
+				if charged[i] {
+					s.releaseLocked(pendingUplink, int64(len(f.Payload))+queueItemCost, 1)
+				}
+
+				continue
+			}
+
+			st.upQueue = append(st.upQueue, append([]byte(nil), f.Payload...))
+			st.receiveWindow -= int64(len(f.Payload))
+			wake(st.upWake)
+		case FrameWindow:
+			if st == nil {
+				continue
+			}
+
+			n, _ := WindowAmount(f.Payload)
+			st.sendCredit = min(st.sendCredit+int64(n), math.MaxUint32)
+			wake(st.downWake)
+		case FrameClose:
+			if st != nil {
+				s.closeStreamLocked(st, false)
+			}
+		}
+	}
+
+	return toStart
+}
