@@ -22,7 +22,9 @@ const permissionsPolicy = "accelerometer=(), autoplay=(), camera=(), clipboard-r
 var (
 	errBridge = errors.New("cannot render bridge page")
 
-	bridgePlaceholders = []string{"__NONCE__", "__RELAY_BASE__", "__BOOTSTRAP__", "__BATCH_LIMIT__"}
+	bridgePlaceholders = []string{
+		"__NONCE__", "__RELAY_BASE__", "__BOOTSTRAP__", "__BATCH_LIMIT__", "__LONG_POLL_MS__",
+	}
 )
 
 // bridgePage is a rendered bridge page together with its per-response
@@ -33,18 +35,23 @@ type bridgePage struct {
 	CSP   string
 }
 
-// renderBridge renders the bridge page for one bootstrap token.
-func renderBridge(hostname, bootstrap string, batchBytes int) (bridgePage, error) {
-	return renderBridgeTemplate(bridgeTemplate, hostname, bootstrap, batchBytes)
+// renderBridge renders the bridge page for one bootstrap token. longPollMs
+// is the server long-poll timeout; the page bounds its downlink requests by it.
+func renderBridge(hostname, bootstrap string, batchBytes, longPollMs int) (bridgePage, error) {
+	return renderBridgeTemplate(bridgeTemplate, hostname, bootstrap, batchBytes, longPollMs)
 }
 
-func renderBridgeTemplate(tmpl, hostname, bootstrap string, batchBytes int) (bridgePage, error) {
+func renderBridgeTemplate(tmpl, hostname, bootstrap string, batchBytes, longPollMs int) (bridgePage, error) {
 	if hostname == "" {
 		return bridgePage{}, fmt.Errorf("%w: empty hostname", errBridge)
 	}
 
 	if batchBytes <= 0 {
 		return bridgePage{}, fmt.Errorf("%w: batch limit %d is not positive", errBridge, batchBytes)
+	}
+
+	if longPollMs <= 0 {
+		return bridgePage{}, fmt.Errorf("%w: long poll %d ms is not positive", errBridge, longPollMs)
 	}
 
 	for _, p := range bridgePlaceholders {
@@ -76,6 +83,7 @@ func renderBridgeTemplate(tmpl, hostname, bootstrap string, batchBytes int) (bri
 		"__RELAY_BASE__", string(relayBase),
 		"__BOOTSTRAP__", string(boot),
 		"__BATCH_LIMIT__", strconv.Itoa(batchBytes),
+		"__LONG_POLL_MS__", strconv.Itoa(longPollMs),
 	).Replace(tmpl)
 
 	for _, p := range bridgePlaceholders {
@@ -129,12 +137,15 @@ const bridgeTemplate = `<!doctype html>
   const RELAY_BASE = __RELAY_BASE__;
   const BOOTSTRAP = __BOOTSTRAP__;
   const BATCH_LIMIT = __BATCH_LIMIT__;
+  const LONG_POLL_MS = __LONG_POLL_MS__;
 
   const FRAME_HEADER = 8;
   const MAX_FRAMES = 4096;
   const QUEUE_MAX_BYTES = 32 * 1024 * 1024;
   const QUEUE_MAX_ITEMS = 16384;
   const REQUEST_TIMEOUT_MS = 90000;
+  // A parked poll lasts LONG_POLL_MS at most; past this margin it is dead.
+  const POLL_TIMEOUT_MS = LONG_POLL_MS + 5000;
   const RETRY_BUDGET_MS = 90000;
   const RETRY_AFTER_CAP_MS = 30000;
   const BACKOFF_MIN_MS = 250;
@@ -329,10 +340,11 @@ const bridgeTemplate = `<!doctype html>
 
   // ---- HTTP --------------------------------------------------------------
 
-  // exchange performs one request with fixed options and a 90 s abort timer.
-  async function exchange(method, path, headers, body) {
+  // exchange performs one request with fixed options and an abort timer.
+  // A timeout rejects like a network error.
+  async function exchange(method, path, headers, body, timeoutMs) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     inflight.add(controller);
     try {
       const init = Object.assign({}, FETCH_OPTIONS, {method, headers, signal: controller.signal});
@@ -346,25 +358,29 @@ const bridgeTemplate = `<!doctype html>
     }
   }
 
-  // request retries the byte-identical request: 503 after Retry-After
-  // within the budget, network errors with exponential backoff.
-  async function request(method, path, headers, body) {
-    const started = Date.now();
+  // request retries the byte-identical request: 503 after Retry-After,
+  // network errors (timeouts included) with exponential backoff. The retry
+  // budget starts at the first failure, not at the first attempt, so a
+  // request that stalled until its abort timer can still be retried.
+  async function request(method, path, headers, body, timeoutMs = REQUEST_TIMEOUT_MS) {
+    let firstFailure = null;
     let failures = 0;
     for (;;) {
       if (closed) throw new ClosedError();
       let res;
       try {
-        res = await exchange(method, path, headers, body);
+        res = await exchange(method, path, headers, body, timeoutMs);
       } catch (err) {
         if (closed) throw new ClosedError();
+        if (firstFailure === null) firstFailure = Date.now();
         failures++;
         if (failures >= NETWORK_ATTEMPTS) throw err;
-        await waitRetry(started, backoff(failures));
+        await waitRetry(firstFailure, backoff(failures));
         continue;
       }
       if (res.status === 503) {
-        await waitRetry(started, parseRetryAfter(res.headers.get('Retry-After')));
+        if (firstFailure === null) firstFailure = Date.now();
+        await waitRetry(firstFailure, parseRetryAfter(res.headers.get('Retry-After')));
         continue;
       }
       if (status === 'reconnecting') setStatus(sessionToken ? 'connected' : 'connecting');
@@ -372,8 +388,8 @@ const bridgeTemplate = `<!doctype html>
     }
   }
 
-  async function waitRetry(started, delay) {
-    if (Date.now() - started + delay > RETRY_BUDGET_MS) throw new Error('retry budget exhausted');
+  async function waitRetry(firstFailure, delay) {
+    if (Date.now() - firstFailure + delay > RETRY_BUDGET_MS) throw new Error('retry budget exhausted');
     setStatus('reconnecting');
     await sleep(delay);
     if (closed) throw new ClosedError();
@@ -476,7 +492,7 @@ const bridgeTemplate = `<!doctype html>
       const res = await request('POST', 'api/v1/down', {
         'Authorization': 'Bearer ' + sessionToken,
         'X-Down-Cursor': downCursor,
-      }, null);
+      }, null, POLL_TIMEOUT_MS);
       if (res.status === 204) continue;
       const next = parseCounter(res.headers.get('X-Down-Cursor'));
       if (res.status !== 200 || res.body.length === 0 || next === null || !frameEnds(res.body)) {

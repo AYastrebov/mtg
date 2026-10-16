@@ -18,7 +18,7 @@ const testBootstrap = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-AbCdEf"
 func renderTestBridge(t *testing.T) bridgePage {
 	t.Helper()
 
-	p, err := renderBridge("proxy.example.com", testBootstrap, 2<<20)
+	p, err := renderBridge("proxy.example.com", testBootstrap, 2<<20, 25000)
 	require.NoError(t, err)
 
 	return p
@@ -39,6 +39,7 @@ func TestRenderBridgeSubstitutes(t *testing.T) {
 	assert.Contains(t, body, `"https://proxy.example.com/"`)
 	assert.Contains(t, body, `"`+testBootstrap+`"`)
 	assert.Contains(t, body, "2097152")
+	assert.Contains(t, body, "const LONG_POLL_MS = 25000;")
 	assert.Equal(t, 1, strings.Count(body, "<script"))
 	assert.Contains(t, body, "<title>Connection</title>")
 	assert.True(t, strings.HasPrefix(body, "<!doctype html>"))
@@ -48,28 +49,38 @@ func TestRenderBridgeSubstitutes(t *testing.T) {
 }
 
 func TestRenderBridgeEscapesValues(t *testing.T) {
-	p, err := renderBridge("proxy.example.com", "</script><b>", 2<<20)
+	p, err := renderBridge("proxy.example.com", "</script><b>", 2<<20, 25000)
 	require.NoError(t, err)
 	assert.NotContains(t, string(p.Body), "</script><b>")
 }
 
 func TestRenderBridgeRejectsBadInput(t *testing.T) {
-	_, err := renderBridge("", testBootstrap, 2<<20)
+	_, err := renderBridge("", testBootstrap, 2<<20, 25000)
 	require.Error(t, err)
 
-	_, err = renderBridge("proxy.example.com", testBootstrap, 0)
+	_, err = renderBridge("proxy.example.com", testBootstrap, 0, 25000)
+	require.Error(t, err)
+
+	_, err = renderBridge("proxy.example.com", testBootstrap, 2<<20, 0)
 	require.Error(t, err)
 }
 
 func TestRenderBridgeFailsOnSurvivingPlaceholder(t *testing.T) {
-	_, err := renderBridgeTemplate(bridgeTemplate+"__NONCE__", "proxy.example.com", testBootstrap, 2<<20)
+	_, err := renderBridgeTemplate(bridgeTemplate+"__NONCE__", "proxy.example.com", testBootstrap, 2<<20, 25000)
 	require.NoError(t, err) // all occurrences are substituted
 
 	_, err = renderBridgeTemplate(strings.Replace(bridgeTemplate, "__BATCH_LIMIT__", "1", 1),
-		"proxy.example.com", testBootstrap, 2<<20)
+		"proxy.example.com", testBootstrap, 2<<20, 25000)
 	require.Error(t, err) // a placeholder is missing from the template
 
-	_, err = renderBridgeTemplate(bridgeTemplate, "proxy.example.com", "__BOOTSTRAP__", 2<<20)
+	_, err = renderBridgeTemplate(strings.Replace(bridgeTemplate, "__LONG_POLL_MS__", "1", 1),
+		"proxy.example.com", testBootstrap, 2<<20, 25000)
+	require.Error(t, err) // the long-poll placeholder is missing from the template
+
+	_, err = renderBridgeTemplate(bridgeTemplate, "proxy.example.com", "__LONG_POLL_MS__", 2<<20, 25000)
+	require.Error(t, err) // the long-poll placeholder survives
+
+	_, err = renderBridgeTemplate(bridgeTemplate, "proxy.example.com", "__BOOTSTRAP__", 2<<20, 25000)
 	require.Error(t, err) // a placeholder survives
 }
 
