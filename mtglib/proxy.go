@@ -19,6 +19,16 @@ import (
 	"github.com/panjf2000/ants/v2"
 )
 
+// poolTask is the unit of work handed to the worker pool.
+type poolTask struct {
+	conn essentials.Conn
+
+	// web marks a connection that arrived through ServeWebConn: TLS is already
+	// terminated and the stream starts with the obfuscated2 handshake.
+	web       bool
+	secretIdx int
+}
+
 // Proxy is an MTPROTO proxy structure.
 type Proxy struct {
 	ctx             context.Context
@@ -105,6 +115,13 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 		return
 	}
 
+	p.serveAuthenticated(ctx)
+}
+
+// serveAuthenticated is the tail shared by every entry point: once the client
+// handshake has succeeded and ctx.dc is known, it drops the handshake deadline,
+// dials Telegram and relays until either side goes away.
+func (p *Proxy) serveAuthenticated(ctx *streamContext) {
 	if err := ctx.clientConn.SetDeadline(time.Time{}); err != nil {
 		ctx.logger.WarningError("cannot set deadline", err)
 		return
@@ -160,7 +177,7 @@ func (p *Proxy) Serve(listener net.Listener) error {
 			continue
 		}
 
-		err = p.workerPool.Invoke(conn)
+		err = p.workerPool.Invoke(poolTask{conn: conn.(essentials.Conn)}) //nolint: forcetypeassert
 
 		switch {
 		case err == nil:
@@ -425,7 +442,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 
 	pool, err := ants.NewPoolWithFunc(opts.getConcurrency(),
 		func(arg any) {
-			proxy.ServeConn(arg.(essentials.Conn)) //nolint: forcetypeassert
+			proxy.ServeConn(arg.(poolTask).conn) //nolint: forcetypeassert
 		},
 		ants.WithLogger(opts.getLogger("ants")),
 		ants.WithNonblocking(true))
