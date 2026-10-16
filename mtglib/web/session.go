@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -49,6 +50,7 @@ var (
 	errBackpressure    = errors.New("web session backpressure")
 	errConcurrent      = errors.New("concurrent uplink request")
 	errSessionClosed   = errors.New("web session is closed")
+	errCursor          = fmt.Errorf("%w: unexpected downlink cursor", errSessionProtocol)
 )
 
 // downItem is a queued downlink frame. Its payload is owned by the queue.
@@ -117,6 +119,16 @@ type session struct {
 	lastSeq    uint64
 	lastDigest [sha256.Size]byte
 	upBusy     bool
+
+	// downCursor is the cursor of the last batch handed out (0: none yet).
+	downCursor uint64
+	// unacked is the last batch handed out and not yet acknowledged (its
+	// cursor is downCursor); its items keep their budget until the ack.
+	// unackedBody is its encoded form, replayed verbatim on a retry.
+	unacked     []*downItem
+	unackedBody []byte
+	// waiter is closed to supersede the currently parked poll.
+	waiter chan struct{}
 
 	isClosed bool
 	done     chan struct{}
@@ -204,6 +216,8 @@ func (s *session) closeLocked() {
 	}
 
 	s.downlink = nil
+	s.unacked = nil
+	s.unackedBody = nil
 
 	close(s.done)
 	s.logger.Debug("session closed")
@@ -755,6 +769,7 @@ func (s *session) processUp(seq uint64, body []byte) (uint64, error) {
 		return 0, errConcurrent
 	}
 
+	s.activity = s.now()
 	digest := sha256.Sum256(body)
 
 	switch {
@@ -948,4 +963,169 @@ func (s *session) applyLocked(frames []Frame, charged []bool) []*stream {
 	}
 
 	return toStart
+}
+
+// --- downlink poll ---------------------------------------------------------
+
+// poll is a downlink long poll. cursor is the client's acknowledgement: the
+// cursor of the last batch it received. It returns the next batch (or nil
+// if there is nothing to send) and the cursor the client has to send next.
+// The returned body is shared with a possible retry and must not be
+// modified.
+func (s *session) poll(ctx context.Context, cursor uint64, longPoll time.Duration) ([]byte, uint64, error) {
+	s.mu.Lock()
+
+	if s.isClosed {
+		s.mu.Unlock()
+
+		return nil, 0, errSessionClosed
+	}
+
+	s.activity = s.now()
+
+	switch {
+	case s.unacked != nil && cursor == s.downCursor-1:
+		// the previous response was lost: replay it verbatim
+		body, next := s.unackedBody, s.downCursor
+		s.mu.Unlock()
+
+		return body, next, nil
+	case cursor != s.downCursor:
+		return nil, 0, s.cursorErrorLocked()
+	case s.unacked != nil:
+		s.ackLocked()
+	}
+
+	if s.waiter != nil {
+		close(s.waiter) // newest poll wins
+	}
+
+	mine := make(chan struct{})
+	s.waiter = mine
+
+	timer := time.NewTimer(longPoll)
+	defer timer.Stop()
+
+	for {
+		switch {
+		case s.isClosed:
+			s.dropWaiterLocked(mine)
+			s.mu.Unlock()
+
+			return nil, 0, errSessionClosed
+		case s.waiter != mine:
+			s.mu.Unlock()
+			// we may have consumed a notification meant for the new waiter
+			wake(s.downlinkNotify)
+
+			return nil, cursor, nil
+		case len(s.downlink) > 0:
+			s.dropWaiterLocked(mine)
+			body, next := s.cutBatchLocked()
+			s.activity = s.now()
+			s.mu.Unlock()
+
+			return body, next, nil
+		}
+
+		s.mu.Unlock()
+
+		select {
+		case <-s.downlinkNotify:
+		case <-mine:
+		case <-s.done:
+		case <-ctx.Done():
+			s.mu.Lock()
+			s.dropWaiterLocked(mine)
+			s.mu.Unlock()
+
+			return nil, 0, ctx.Err() //nolint: wrapcheck
+		case <-timer.C:
+			s.mu.Lock()
+
+			if s.waiter == mine && !s.isClosed {
+				s.dropWaiterLocked(mine)
+				next := s.downCursor
+				s.activity = s.now()
+				s.mu.Unlock()
+
+				return nil, next, nil
+			}
+
+			continue // superseded or closed meanwhile: handled above
+		}
+
+		s.mu.Lock()
+	}
+}
+
+func (s *session) dropWaiterLocked(mine chan struct{}) {
+	if s.waiter == mine {
+		s.waiter = nil
+	}
+}
+
+// cursorErrorLocked closes the session and unlocks the mutex.
+func (s *session) cursorErrorLocked() error {
+	s.logger.Info("protocol violation: unexpected downlink cursor")
+	s.closeLocked()
+	s.mu.Unlock()
+
+	return errCursor
+}
+
+// ackLocked releases the budget of the acknowledged batch, exactly once.
+func (s *session) ackLocked() {
+	var (
+		bytes [pendingClasses]int64
+		items [pendingClasses]int
+	)
+
+	for _, it := range s.unacked {
+		bytes[it.class] += it.bytes
+		items[it.class] += it.items
+	}
+
+	s.unacked = nil
+	s.unackedBody = nil
+
+	for class := range pendingClasses {
+		s.releaseLocked(pendingClass(class), bytes[class], items[class])
+	}
+
+	for _, st := range s.streams {
+		wake(st.downWake)
+	}
+}
+
+// cutBatchLocked takes up to MaxBatchFrames pending frames that fit into
+// CarrierBatchBytes (at least one) into a new unacknowledged batch.
+func (s *session) cutBatchLocked() ([]byte, uint64) {
+	var (
+		n    int
+		size int
+	)
+
+	for _, it := range s.downlink {
+		frameSize := FrameHeaderSize + len(it.frame.Payload)
+		if n == MaxBatchFrames || (n > 0 && size+frameSize > s.limits.CarrierBatchBytes) {
+			break
+		}
+
+		n++
+		size += frameSize
+	}
+
+	items := s.popDownlinkLocked(n)
+	body := make([]byte, 0, size)
+
+	for _, it := range items {
+		body = AppendFrame(body, it.frame.Type, it.frame.StreamID, it.frame.Payload)
+	}
+
+	s.downCursor++
+	s.unacked = items
+	s.unackedBody = body
+
+	return body, s.downCursor
 }

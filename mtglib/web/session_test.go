@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -1030,4 +1031,312 @@ func TestSessionProxyCloseKeepsDownlink(t *testing.T) {
 	assert.Equal(t, "hello", string(frames[0].Payload))
 	assert.Equal(t, FrameClose, frames[1].Type)
 	assert.EqualValues(t, 7, frames[1].StreamID)
+}
+
+// --- downlink poll ----------------------------------------------------------
+
+func hasWaiter(s *session) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.waiter != nil
+}
+
+func waitParked(t *testing.T, s *session) {
+	t.Helper()
+
+	require.Eventually(t, func() bool { return hasWaiter(s) }, time.Second, time.Millisecond)
+}
+
+type pollResult struct {
+	body []byte
+	next uint64
+	err  error
+	at   time.Time
+}
+
+func goPoll(ctx context.Context, s *session, cursor uint64, longPoll time.Duration) <-chan pollResult {
+	ch := make(chan pollResult, 1)
+
+	go func() {
+		body, next, err := s.poll(ctx, cursor, longPoll)
+		ch <- pollResult{body: body, next: next, err: err, at: time.Now()}
+	}()
+
+	return ch
+}
+
+func TestSessionPollReturnsBatchAndCursor(t *testing.T) {
+	h := newTestSession(t, nil)
+	ctx := context.Background()
+
+	require.True(t, h.s.queueDownlink(Frame{Type: FrameWindow, StreamID: 7, Payload: WindowPayload(5)}, pendingControl))
+	require.True(t, h.s.queueDownlink(Frame{Type: FrameData, StreamID: 7, Payload: []byte("hello")}, pendingDownlink))
+
+	body, next, err := h.s.poll(ctx, 0, time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), next)
+
+	frames, err := ParseFrames(body, MaxFramePayload)
+	require.NoError(t, err)
+	require.Len(t, frames, 2)
+	assert.Equal(t, FrameWindow, frames[0].Type)
+	assert.Equal(t, uint32(7), frames[0].StreamID)
+	n, _ := WindowAmount(frames[0].Payload)
+	assert.Equal(t, uint32(5), n)
+	assert.Equal(t, FrameData, frames[1].Type)
+	assert.Equal(t, []byte("hello"), frames[1].Payload)
+
+	// budget stays charged until the ack
+	bs, items := h.sink.totals()
+	assert.NotZero(t, bs[pendingControl])
+	assert.Equal(t, 1, items[pendingDownlink])
+
+	again, next, err := h.s.poll(ctx, 0, time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), next)
+	assert.Equal(t, body, again)
+
+	start := time.Now()
+	body, next, err = h.s.poll(ctx, 1, 10*time.Millisecond)
+	require.NoError(t, err)
+	assert.Empty(t, body)
+	assert.Equal(t, uint64(1), next)
+	assert.GreaterOrEqual(t, time.Since(start), 10*time.Millisecond)
+
+	bs, items = h.sink.totals()
+	assert.Equal(t, [3]int64{}, bs)
+	assert.Equal(t, [3]int{}, items)
+
+	_, _, err = h.s.poll(ctx, 5, time.Second)
+	require.ErrorIs(t, err, errCursor)
+	require.ErrorIs(t, err, errSessionProtocol)
+	assert.True(t, isClosed(h.s))
+
+	_, _, err = h.s.poll(ctx, 1, time.Second)
+	require.ErrorIs(t, err, errSessionClosed)
+}
+
+func TestSessionPollCursorMismatchWithUnacked(t *testing.T) {
+	h := newTestSession(t, nil)
+	ctx := context.Background()
+
+	require.True(t, h.s.queueDownlink(Frame{Type: FrameClose, StreamID: 1}, pendingControl))
+
+	_, next, err := h.s.poll(ctx, 0, time.Second)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), next)
+
+	_, _, err = h.s.poll(ctx, 2, time.Second)
+	require.ErrorIs(t, err, errCursor)
+	assert.True(t, isClosed(h.s))
+
+	bs, items := h.sink.totals()
+	assert.Equal(t, [3]int64{}, bs)
+	assert.Equal(t, [3]int{}, items)
+}
+
+func TestSessionPollNewestWins(t *testing.T) {
+	h := newTestSession(t, nil)
+	ctx := context.Background()
+
+	a := goPoll(ctx, h.s, 0, time.Second)
+	waitParked(t, h.s)
+
+	h.s.mu.Lock()
+	first := h.s.waiter
+	h.s.mu.Unlock()
+
+	b := goPoll(ctx, h.s, 0, time.Second)
+
+	select {
+	case r := <-a:
+		require.NoError(t, r.err)
+		assert.Nil(t, r.body)
+		assert.Equal(t, uint64(0), r.next)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("superseded poll did not return")
+	}
+
+	require.Eventually(t, func() bool {
+		h.s.mu.Lock()
+		defer h.s.mu.Unlock()
+
+		return h.s.waiter != nil && h.s.waiter != first
+	}, time.Second, time.Millisecond)
+
+	require.True(t, h.s.queueDownlink(Frame{Type: FrameClose, StreamID: 9}, pendingControl))
+
+	select {
+	case r := <-b:
+		require.NoError(t, r.err)
+		assert.Equal(t, uint64(1), r.next)
+		frames, err := ParseFrames(r.body, MaxFramePayload)
+		require.NoError(t, err)
+		require.Len(t, frames, 1)
+		assert.Equal(t, FrameClose, frames[0].Type)
+		assert.Equal(t, uint32(9), frames[0].StreamID)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("newest poll did not get the frame")
+	}
+}
+
+func TestSessionPollTimeout(t *testing.T) {
+	h := newTestSession(t, nil)
+
+	start := time.Now()
+	body, next, err := h.s.poll(context.Background(), 0, 20*time.Millisecond)
+	require.NoError(t, err)
+	assert.Empty(t, body)
+	assert.Equal(t, uint64(0), next)
+	assert.GreaterOrEqual(t, time.Since(start), 20*time.Millisecond)
+	assert.False(t, hasWaiter(h.s))
+}
+
+func TestSessionPollCancelled(t *testing.T) {
+	h := newTestSession(t, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	res := goPoll(ctx, h.s, 0, 5*time.Second)
+	waitParked(t, h.s)
+
+	cancelled := time.Now()
+	cancel()
+
+	select {
+	case r := <-res:
+		require.ErrorIs(t, r.err, context.Canceled)
+		assert.Nil(t, r.body)
+		assert.Equal(t, uint64(0), r.next)
+		assert.Less(t, r.at.Sub(cancelled), 50*time.Millisecond)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled poll did not return")
+	}
+
+	assert.False(t, isClosed(h.s))
+
+	require.True(t, h.s.queueDownlink(Frame{Type: FrameClose, StreamID: 3}, pendingControl))
+
+	body, next, err := h.s.poll(context.Background(), 0, time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), next)
+	assert.NotEmpty(t, body)
+	assert.False(t, isClosed(h.s))
+}
+
+func TestSessionPollSessionClosedWhileParked(t *testing.T) {
+	h := newTestSession(t, nil)
+
+	res := goPoll(context.Background(), h.s, 0, 5*time.Second)
+	waitParked(t, h.s)
+	h.s.close()
+
+	select {
+	case r := <-res:
+		require.ErrorIs(t, r.err, errSessionClosed)
+	case <-time.After(time.Second):
+		t.Fatal("parked poll did not notice close")
+	}
+}
+
+func TestSessionPollTouches(t *testing.T) {
+	h := newTestSession(t, nil)
+	h.s.touch(time.Unix(1, 0))
+
+	_, _, err := h.s.poll(context.Background(), 0, 0)
+	require.NoError(t, err)
+	assert.True(t, h.s.lastActivity().After(time.Unix(1, 0)))
+
+	h.s.touch(time.Unix(1, 0))
+	_, err = h.s.processUp(1, openFrame(1))
+	require.NoError(t, err)
+	assert.True(t, h.s.lastActivity().After(time.Unix(1, 0)))
+}
+
+func pollFrames(t *testing.T, s *session, cursor uint64) ([]Frame, uint64) {
+	t.Helper()
+
+	body, next, err := s.poll(context.Background(), cursor, time.Second)
+	require.NoError(t, err)
+
+	frames, err := ParseFrames(body, MaxFramePayload)
+	require.NoError(t, err)
+
+	return frames, next
+}
+
+func TestSessionBatchLimits(t *testing.T) {
+	t.Run("frames", func(t *testing.T) {
+		h := newTestSession(t, nil)
+
+		for i := range 5000 {
+			require.True(t, h.s.queueDownlink(Frame{Type: FrameClose, StreamID: uint32(i + 1)}, pendingControl))
+		}
+
+		frames, next := pollFrames(t, h.s, 0)
+		assert.Len(t, frames, MaxBatchFrames)
+		assert.Equal(t, uint64(1), next)
+
+		frames, next = pollFrames(t, h.s, 1)
+		assert.Len(t, frames, 5000-MaxBatchFrames)
+		assert.Equal(t, uint64(2), next)
+		assert.Equal(t, uint32(MaxBatchFrames+1), frames[0].StreamID)
+	})
+
+	t.Run("bytes", func(t *testing.T) {
+		h := newTestSession(t, func(l *Limits) { l.CarrierBatchBytes = 256 << 10 })
+
+		for i := range 3 {
+			require.True(t, h.s.queueDownlink(Frame{
+				Type: FrameData, StreamID: uint32(i + 1), Payload: make([]byte, 100<<10),
+			}, pendingDownlink))
+		}
+
+		frames, next := pollFrames(t, h.s, 0)
+		assert.Len(t, frames, 2)
+
+		frames, _ = pollFrames(t, h.s, next)
+		assert.Len(t, frames, 1)
+	})
+
+	t.Run("oversized frame alone", func(t *testing.T) {
+		h := newTestSession(t, func(l *Limits) { l.CarrierBatchBytes = 256 << 10 })
+
+		require.True(t, h.s.queueDownlink(Frame{
+			Type: FrameData, StreamID: 1, Payload: make([]byte, 1<<20),
+		}, pendingDownlink))
+		require.True(t, h.s.queueDownlink(Frame{Type: FrameClose, StreamID: 1}, pendingControl))
+
+		frames, next := pollFrames(t, h.s, 0)
+		require.Len(t, frames, 1)
+		assert.Len(t, frames[0].Payload, 1<<20)
+
+		frames, _ = pollFrames(t, h.s, next)
+		require.Len(t, frames, 1)
+		assert.Equal(t, FrameClose, frames[0].Type)
+	})
+}
+
+func TestSessionPollAckWakesDownlinkPump(t *testing.T) {
+	h := newTestSession(t, nil)
+
+	_, err := h.s.processUp(1, openFrame(7))
+	require.NoError(t, err)
+
+	proxy := h.serve.conn(t, 0)
+	_, err = proxy.Write([]byte("abc"))
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool { return hasFrame(h.s, FrameData, 7) }, time.Second, time.Millisecond)
+
+	frames, next := pollFrames(t, h.s, 0)
+	require.Len(t, frames, 1)
+	assert.Equal(t, []byte("abc"), frames[0].Payload)
+
+	_, _, err = h.s.poll(context.Background(), next, 0)
+	require.NoError(t, err)
+
+	bs, items := h.sink.totals()
+	assert.Equal(t, [3]int64{}, bs)
+	assert.Equal(t, [3]int{}, items)
 }
