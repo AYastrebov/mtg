@@ -1,6 +1,7 @@
 package web
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -29,6 +30,10 @@ func TestLimitsValidateRejects(t *testing.T) {
 		"reserve items":     func(l *Limits) { l.MaxPendingItemsGlobal = 1000 },
 		"frame payload big": func(l *Limits) { l.MaxFramePayload = 2 << 20 },
 		"frame payload 0":   func(l *Limits) { l.MaxFramePayload = 0 },
+		"sessions MaxInt":   func(l *Limits) { l.MaxSessions = math.MaxInt },
+		"streams/session":   func(l *Limits) { l.MaxStreamsPerSession = math.MaxInt / 2 },
+		"huge pending":      func(l *Limits) { l.MaxPendingGlobal = math.MaxInt64 },
+		"huge per ip":       func(l *Limits) { l.MaxSessionsPerIP = math.MaxInt },
 		"zero streams":      func(l *Limits) { l.MaxStreams = 0 },
 		"negative per ip":   func(l *Limits) { l.MaxSessionsPerIP = -1 },
 	}

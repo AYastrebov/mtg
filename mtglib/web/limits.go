@@ -13,6 +13,14 @@ const (
 	minCarrierBatchBytes = 256 << 10
 	maxCarrierBatchBytes = 2 << 20
 	maxFramePayloadLimit = 1 << 20
+
+	// maxCount caps every count field so that no intermediate product can
+	// overflow, including on 32-bit builds.
+	maxCount = 1 << 30
+	// maxStreamsPerSessionLimit is lower because controlReserveItems
+	// multiplies it by 3 in int.
+	maxStreamsPerSessionLimit = 1 << 20
+	maxBytesLimit             = 1 << 50
 )
 
 // ErrLimits is returned when Limits are inconsistent.
@@ -127,36 +135,41 @@ func (l Limits) validate() error {
 	positive := []struct {
 		name  string
 		value int64
+		max   int64
 	}{
-		{"MaxSessions", int64(l.MaxSessions)},
-		{"MaxStreams", int64(l.MaxStreams)},
-		{"MaxStreamsPerSession", int64(l.MaxStreamsPerSession)},
-		{"NewSessionsPerMinute", int64(l.NewSessionsPerMinute)},
-		{"NewSessionsBurst", int64(l.NewSessionsBurst)},
-		{"NewStreamsPerMinute", int64(l.NewStreamsPerMinute)},
-		{"NewStreamsBurst", int64(l.NewStreamsBurst)},
-		{"MaxBootstraps", int64(l.MaxBootstraps)},
-		{"NewBootstrapsPerMinute", int64(l.NewBootstrapsPerMinute)},
-		{"NewBootstrapsBurst", int64(l.NewBootstrapsBurst)},
-		{"MaxPendingPerSession", l.MaxPendingPerSession},
-		{"MaxPendingGlobal", l.MaxPendingGlobal},
-		{"MaxPendingItemsPerSession", int64(l.MaxPendingItemsPerSession)},
-		{"MaxPendingItemsGlobal", int64(l.MaxPendingItemsGlobal)},
-		{"MaxBodyBytes", int64(l.MaxBodyBytes)},
-		{"MaxClosedStreamIDs", int64(l.MaxClosedStreamIDs)},
+		{"MaxSessions", int64(l.MaxSessions), maxCount},
+		{"MaxStreams", int64(l.MaxStreams), maxCount},
+		{"MaxStreamsPerSession", int64(l.MaxStreamsPerSession), maxStreamsPerSessionLimit},
+		{"NewSessionsPerMinute", int64(l.NewSessionsPerMinute), maxCount},
+		{"NewSessionsBurst", int64(l.NewSessionsBurst), maxCount},
+		{"NewStreamsPerMinute", int64(l.NewStreamsPerMinute), maxCount},
+		{"NewStreamsBurst", int64(l.NewStreamsBurst), maxCount},
+		{"MaxBootstraps", int64(l.MaxBootstraps), maxCount},
+		{"NewBootstrapsPerMinute", int64(l.NewBootstrapsPerMinute), maxCount},
+		{"NewBootstrapsBurst", int64(l.NewBootstrapsBurst), maxCount},
+		{"MaxPendingPerSession", l.MaxPendingPerSession, maxBytesLimit},
+		{"MaxPendingGlobal", l.MaxPendingGlobal, maxBytesLimit},
+		{"MaxPendingItemsPerSession", int64(l.MaxPendingItemsPerSession), maxCount},
+		{"MaxPendingItemsGlobal", int64(l.MaxPendingItemsGlobal), maxCount},
+		{"MaxBodyBytes", int64(l.MaxBodyBytes), maxCount},
+		{"MaxClosedStreamIDs", int64(l.MaxClosedStreamIDs), maxCount},
 	}
 	for _, p := range positive {
 		if p.value <= 0 {
 			return fmt.Errorf("%w: %s must be positive, got %d", ErrLimits, p.name, p.value)
 		}
+
+		if p.value > p.max {
+			return fmt.Errorf("%w: %s %d exceeds maximum %d", ErrLimits, p.name, p.value, p.max)
+		}
 	}
 
-	if l.MaxSessionsPerIP < 0 {
-		return fmt.Errorf("%w: MaxSessionsPerIP must not be negative", ErrLimits)
+	if l.MaxSessionsPerIP < 0 || l.MaxSessionsPerIP > maxCount {
+		return fmt.Errorf("%w: MaxSessionsPerIP %d is out of [0, %d]", ErrLimits, l.MaxSessionsPerIP, maxCount)
 	}
 
-	if l.MaxBootstrapsPerIP < 0 {
-		return fmt.Errorf("%w: MaxBootstrapsPerIP must not be negative", ErrLimits)
+	if l.MaxBootstrapsPerIP < 0 || l.MaxBootstrapsPerIP > maxCount {
+		return fmt.Errorf("%w: MaxBootstrapsPerIP %d is out of [0, %d]", ErrLimits, l.MaxBootstrapsPerIP, maxCount)
 	}
 
 	maxBatch := min(l.MaxBodyBytes, maxCarrierBatchBytes)
@@ -170,11 +183,12 @@ func (l Limits) validate() error {
 			ErrLimits, l.MaxFramePayload, maxFramePayloadLimit)
 	}
 
-	if l.controlReserveBytes()*int64(l.MaxSessions) >= l.MaxPendingGlobal {
+	// Division instead of multiplication: reserve*MaxSessions < Global.
+	if int64(l.MaxSessions) > (l.MaxPendingGlobal-1)/l.controlReserveBytes() {
 		return fmt.Errorf("%w: control reserve of MaxSessions exhausts MaxPendingGlobal", ErrLimits)
 	}
 
-	if l.controlReserveItems()*l.MaxSessions >= l.MaxPendingItemsGlobal {
+	if int64(l.MaxSessions) > (int64(l.MaxPendingItemsGlobal)-1)/int64(l.controlReserveItems()) {
 		return fmt.Errorf("%w: control reserve of MaxSessions exhausts MaxPendingItemsGlobal", ErrLimits)
 	}
 
