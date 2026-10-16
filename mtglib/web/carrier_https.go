@@ -1,0 +1,161 @@
+package web
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"strconv"
+)
+
+const octetStream = "application/octet-stream"
+
+// httpsCarrier carries frames over plain HTTPS requests: one uplink POST per
+// batch and a long-polled downlink POST.
+type httpsCarrier struct {
+	limits   Limits
+	timeouts Timeouts
+
+	// onBytes, if set, is told about every accepted uplink body and every
+	// delivered downlink body.
+	onBytes func(up, down uint64)
+}
+
+func newHTTPSCarrier(limits Limits, timeouts Timeouts) *httpsCarrier {
+	return &httpsCarrier{limits: limits, timeouts: timeouts}
+}
+
+func (c *httpsCarrier) mode() string {
+	return "https"
+}
+
+func (c *httpsCarrier) countBytes(up, down int) {
+	if c.onBytes != nil {
+		c.onBytes(uint64(up), uint64(down)) //nolint: gosec
+	}
+}
+
+func (c *httpsCarrier) handleUp(w http.ResponseWriter, r *http.Request, s *session) {
+	if ct := r.Header.Values("Content-Type"); len(ct) != 1 || ct[0] != octetStream {
+		localNotFound(w)
+
+		return
+	}
+
+	seqs := r.Header.Values("X-Up-Seq")
+	if len(seqs) != 1 {
+		localNotFound(w)
+
+		return
+	}
+
+	seq, err := canonicalUint(seqs[0])
+	if err != nil {
+		localNotFound(w)
+
+		return
+	}
+
+	// MaxBytesError also lands here.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, int64(c.limits.MaxBodyBytes)))
+	if err != nil || len(body) == 0 {
+		localNotFound(w)
+
+		return
+	}
+
+	ack, err := s.processUp(seq, body)
+
+	switch {
+	case errors.Is(err, errBackpressure), errors.Is(err, errConcurrent):
+		h := w.Header()
+		h.Set("Cache-Control", "no-store")
+		h.Set("Retry-After", "1")
+		h.Set("Content-Length", "0")
+		w.WriteHeader(http.StatusServiceUnavailable)
+
+		return
+	case err != nil: // errSessionProtocol, errSessionClosed
+		localNotFound(w)
+
+		return
+	}
+
+	c.countBytes(len(body), 0)
+
+	h := w.Header()
+	h.Set("Cache-Control", "no-store")
+	h.Set("X-Up-Ack", strconv.FormatUint(ack, 10))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (c *httpsCarrier) handleDown(w http.ResponseWriter, r *http.Request, s *session) {
+	if len(r.Header.Values("Content-Type")) != 0 || r.ContentLength > 0 || !emptyBody(r.Body) {
+		localNotFound(w)
+
+		return
+	}
+
+	cursors := r.Header.Values("X-Down-Cursor")
+	if len(cursors) != 1 {
+		localNotFound(w)
+
+		return
+	}
+
+	cursor, err := canonicalUint(cursors[0])
+	if err != nil {
+		localNotFound(w)
+
+		return
+	}
+
+	// body is shared with a possible replay: it is written, never modified.
+	body, next, err := s.poll(r.Context(), cursor, c.timeouts.LongPoll)
+
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return // the client went away; nobody is listening
+	case err != nil: // errCursor, errSessionClosed
+		localNotFound(w)
+
+		return
+	}
+
+	h := w.Header()
+	h.Set("Cache-Control", "no-store")
+	h.Set("X-Down-Cursor", strconv.FormatUint(next, 10))
+
+	if len(body) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+
+		return
+	}
+
+	h.Set("Content-Type", octetStream)
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+
+	if _, err := w.Write(body); err != nil {
+		return
+	}
+
+	c.countBytes(0, len(body))
+}
+
+func (c *httpsCarrier) handleWS(w http.ResponseWriter, _ *http.Request, _ *session) {
+	localNotFound(w)
+}
+
+// emptyBody reports whether a request body has no bytes at all.
+func emptyBody(body io.Reader) bool {
+	if body == nil || body == http.NoBody {
+		return true
+	}
+
+	var one [1]byte
+
+	n, _ := io.ReadFull(body, one[:])
+
+	return n == 0
+}
