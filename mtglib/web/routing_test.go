@@ -123,4 +123,3 @@ func TestLocalNotFound(t *testing.T) {
 	assert.Equal(t, "0", w.Header().Get("Content-Length"))
 	assert.Empty(t, w.Body.String())
 }
-
