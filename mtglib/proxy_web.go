@@ -77,7 +77,27 @@ func (p *Proxy) ServeWebConn(conn essentials.Conn, secretIdx int) error {
 		return ErrIPBlocklisted
 	}
 
+	// Counted before dispatch: ServeWebConn is called from foreign goroutines
+	// that hold no count, so without this Shutdown could pass Wait while a
+	// task is queued. The worker calls Done. admitMutex makes the check and the
+	// Add atomic with respect to Shutdown's cancel, so after Shutdown starts
+	// waiting no further Add can happen.
+	p.admitMutex.RLock()
+
+	if p.ctx.Err() != nil {
+		p.admitMutex.RUnlock()
+		conn.Close() //nolint: errcheck
+
+		return ErrProxyClosed
+	}
+
+	p.streamWaitGroup.Add(1)
+	p.admitMutex.RUnlock()
+
 	err := p.workerPool.Invoke(poolTask{conn: conn, web: true, secretIdx: secretIdx})
+	if err != nil {
+		p.streamWaitGroup.Done()
+	}
 
 	switch {
 	case err == nil:
@@ -98,7 +118,8 @@ func (p *Proxy) ServeWebConn(conn essentials.Conn, secretIdx int) error {
 // serveWebConn is the worker body for ServeWebConn. TLS is already terminated
 // by the caller, so Fake TLS and the doppelganger wrapper are skipped.
 func (p *Proxy) serveWebConn(conn essentials.Conn, secretIdx int) {
-	p.streamWaitGroup.Add(1)
+	// Registered by ServeWebConn before dispatch, so Shutdown waits for workers
+	// that are queued but not yet running.
 	defer p.streamWaitGroup.Done()
 
 	ctx := newStreamContext(p.ctx, p.logger, conn)

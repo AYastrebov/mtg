@@ -346,3 +346,37 @@ func TestServeWebConnReplay(t *testing.T) {
 	_, err = secondClient.Read(make([]byte, 1))
 	assert.Error(t, err)
 }
+
+func TestServeWebConnShutdownRace(t *testing.T) {
+	for range 20 {
+		proxy, rec, _ := newWebProxy(t, webProxyOpts{concurrency: 8})
+
+		const n = 32
+
+		var wg sync.WaitGroup
+
+		for range n {
+			wg.Add(1)
+
+			go func() {
+				defer wg.Done()
+
+				proxySide, clientSide := newWebPipe(t)
+				if err := proxy.ServeWebConn(proxySide, 0); err != nil {
+					// Rejected: the conn must have been closed.
+					_, rerr := clientSide.Read(make([]byte, 1))
+					assert.Error(t, rerr)
+				}
+			}()
+		}
+
+		proxy.Shutdown()
+		wg.Wait()
+		// Calls that raced past Shutdown's Wait are rejected, never queued.
+		proxy.Shutdown()
+
+		assert.Equal(t,
+			len(eventsOf[mtglib.EventStart](rec)),
+			len(eventsOf[mtglib.EventFinish](rec)))
+	}
+}
