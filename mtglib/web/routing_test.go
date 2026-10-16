@@ -29,6 +29,8 @@ func TestClassifyTable(t *testing.T) {
 	}{
 		{"stranger", "POST", "/anything?x=1", "whatever", nil, false, routePublic},
 		{"bridge", "GET", "/?bridge=" + testBridge, host, nil, true, routeBridge},
+		{"bridge cookie", "GET", "/?bridge=" + testBridge, host, map[string][]string{"Cookie": {"a=b"}}, true, routeBridge},
+		{"bridge two auth", "GET", "/?bridge=" + testBridge, host, map[string][]string{"Authorization": {"a", "b"}}, true, routeBridge},
 		{"bridge extra", "GET", "/?bridge=" + testBridge + "&x=1", host, nil, true, routeLocal404},
 		{"bridge case", "GET", "/?Bridge=" + testBridge, host, nil, true, routeLocal404},
 		{"bridge short", "GET", "/?bridge=abc", host, nil, true, routeLocal404},

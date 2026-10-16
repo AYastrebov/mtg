@@ -51,6 +51,9 @@ func classify(r *http.Request, hostname string, carriesSecret bool) routeKind {
 		kind = routeDown
 	case p == "/api/v1/ws" && r.Method == http.MethodGet:
 		kind = routeWS
+	// The Cookie and duplicate-Authorization rejections below apply to API
+	// endpoints only. The bridge is a browser navigation, and the
+	// system-browser fallback may legitimately carry the public site's cookies.
 	case p == "/" && r.Method == http.MethodGet && bridgeQueryRe.MatchString(r.URL.RawQuery):
 		return routeBridge
 	default:
