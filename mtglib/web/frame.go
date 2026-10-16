@@ -147,14 +147,12 @@ func (f Frame) ValidateClientShape() error {
 	case FrameData:
 		ok = f.StreamID != 0 && len(f.Payload) > 0
 	case FrameClose:
-		ok = f.StreamID != 0
+		ok = f.StreamID != 0 && len(f.Payload) == 0
 	case FrameWindow:
 		_, err := WindowAmount(f.Payload)
 		ok = f.StreamID != 0 && err == nil
-	case FramePing, FramePong:
+	case FramePong:
 		ok = f.StreamID == 0 && len(f.Payload) <= maxPingPayload
-	case FrameBye:
-		ok = f.StreamID == 0
 	}
 
 	if !ok {
