@@ -405,9 +405,53 @@ func TestE2EPoolOverloadGetsClose(t *testing.T) {
 	waitServerClose(t, s2)
 	waitFor[mtglib.EventConcurrencyLimited](t, env.rec)
 
+	require.NotEmpty(t, eventsOf[mtglib.EventConcurrencyLimited](env.rec))
+
 	s1.close()
 	waitFor[mtglib.EventFinish](t, env.rec)
 
-	s3 := c.openStream(3)
-	assertEcho(t, s3, data)
+	// The worker goes back to the pool after EventFinish: a CLOSE on a fresh
+	// id means the pool is still busy, so retry with the next one.
+	next := uint32(3)
+
+	require.Eventually(t, func() bool {
+		id := next
+		next++
+
+		return tryOpenEcho(c, id, data)
+	}, e2eWait, 10*time.Millisecond, "no stream was accepted after stream 1 closed")
+}
+
+// tryOpenEcho opens a stream and reports whether it echoes data. It makes no
+// assertions, so it is safe inside require.Eventually.
+func tryOpenEcho(c *bridgeClient, id uint32, data []byte) bool {
+	s := c.openRawStream(id)
+
+	conn, err := obfuscation.Obfuscator{Secret: c.secret.Key[:]}.SendHandshake(s.conn, clientDC)
+	if err != nil {
+		return false
+	}
+
+	s.conn = conn
+	done := make(chan []byte, 1)
+
+	go func() {
+		buf := make([]byte, len(data))
+		if _, err := io.ReadFull(s, buf); err != nil {
+			buf = nil
+		}
+
+		done <- buf
+	}()
+
+	if _, err := s.Write(data); err != nil {
+		return false
+	}
+
+	select {
+	case buf := <-done:
+		return bytes.Equal(data, buf)
+	case <-time.After(e2eWait):
+		return false
+	}
 }
