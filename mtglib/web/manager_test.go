@@ -494,7 +494,7 @@ func TestSessionControlQueueOverflow(t *testing.T) {
 	)
 
 	require.Eventually(t, func() bool {
-		body, next, err := sibling.poll(context.Background(), cursor, 50*time.Millisecond)
+		body, next, err := pollOnce(context.Background(), sibling, cursor, 50*time.Millisecond)
 		require.NoError(t, err)
 
 		cursor = next

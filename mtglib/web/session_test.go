@@ -1179,15 +1179,23 @@ type pollResult struct {
 	at   time.Time
 }
 
+// pollOnce is session.poll for tests that poll outside the HTTP handler:
+// nothing writes the body, so the downlink write slot that comes with a
+// non-empty body is released at once.
+func pollOnce(ctx context.Context, s *session, cursor uint64, longPoll time.Duration) ([]byte, uint64, error) {
+	body, next, err := s.poll(ctx, cursor, longPoll)
+	if len(body) > 0 {
+		s.endDownload()
+	}
+
+	return body, next, err
+}
+
 func goPoll(ctx context.Context, s *session, cursor uint64, longPoll time.Duration) <-chan pollResult {
 	ch := make(chan pollResult, 1)
 
 	go func() {
-		body, next, err := s.poll(ctx, cursor, longPoll)
-		if len(body) > 0 {
-			s.endDownload() // nothing is written here
-		}
-
+		body, next, err := pollOnce(ctx, s, cursor, longPoll)
 		ch <- pollResult{body: body, next: next, err: err, at: time.Now()}
 	}()
 
@@ -1201,10 +1209,9 @@ func TestSessionPollReturnsBatchAndCursor(t *testing.T) {
 	require.True(t, h.s.queueDownlink(Frame{Type: FrameWindow, StreamID: 7, Payload: WindowPayload(5)}, pendingControl))
 	require.True(t, h.s.queueDownlink(Frame{Type: FrameData, StreamID: 7, Payload: []byte("hello")}, pendingDownlink))
 
-	body, next, err := h.s.poll(ctx, 0, time.Second)
+	body, next, err := pollOnce(ctx, h.s, 0, time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), next)
-	h.s.endDownload()
 
 	frames, err := ParseFrames(body, MaxFramePayload)
 	require.NoError(t, err)
@@ -1221,14 +1228,13 @@ func TestSessionPollReturnsBatchAndCursor(t *testing.T) {
 	assert.NotZero(t, bs[pendingControl])
 	assert.Equal(t, 1, items[pendingDownlink])
 
-	again, next, err := h.s.poll(ctx, 0, time.Second)
+	again, next, err := pollOnce(ctx, h.s, 0, time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), next)
 	assert.Equal(t, body, again)
-	h.s.endDownload()
 
 	start := time.Now()
-	body, next, err = h.s.poll(ctx, 1, 10*time.Millisecond)
+	body, next, err = pollOnce(ctx, h.s, 1, 10*time.Millisecond)
 	require.NoError(t, err)
 	assert.Empty(t, body)
 	assert.Equal(t, uint64(1), next)
@@ -1238,12 +1244,12 @@ func TestSessionPollReturnsBatchAndCursor(t *testing.T) {
 	assert.Equal(t, [3]int64{}, bs)
 	assert.Equal(t, [3]int{}, items)
 
-	_, _, err = h.s.poll(ctx, 5, time.Second)
+	_, _, err = pollOnce(ctx, h.s, 5, time.Second)
 	require.ErrorIs(t, err, errCursor)
 	require.ErrorIs(t, err, errSessionProtocol)
 	assert.True(t, isClosed(h.s))
 
-	_, _, err = h.s.poll(ctx, 1, time.Second)
+	_, _, err = pollOnce(ctx, h.s, 1, time.Second)
 	require.ErrorIs(t, err, errSessionClosed)
 }
 
@@ -1253,12 +1259,11 @@ func TestSessionPollCursorMismatchWithUnacked(t *testing.T) {
 
 	require.True(t, h.s.queueDownlink(Frame{Type: FrameClose, StreamID: 1}, pendingControl))
 
-	_, next, err := h.s.poll(ctx, 0, time.Second)
+	_, next, err := pollOnce(ctx, h.s, 0, time.Second)
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), next)
-	h.s.endDownload()
 
-	_, _, err = h.s.poll(ctx, 2, time.Second)
+	_, _, err = pollOnce(ctx, h.s, 2, time.Second)
 	require.ErrorIs(t, err, errCursor)
 	assert.True(t, isClosed(h.s))
 
@@ -1316,7 +1321,7 @@ func TestSessionPollTimeout(t *testing.T) {
 	h := newTestSession(t, nil)
 
 	start := time.Now()
-	body, next, err := h.s.poll(context.Background(), 0, 20*time.Millisecond)
+	body, next, err := pollOnce(context.Background(), h.s, 0, 20*time.Millisecond)
 	require.NoError(t, err)
 	assert.Empty(t, body)
 	assert.Equal(t, uint64(0), next)
@@ -1348,7 +1353,7 @@ func TestSessionPollCancelled(t *testing.T) {
 
 	require.True(t, h.s.queueDownlink(Frame{Type: FrameClose, StreamID: 3}, pendingControl))
 
-	body, next, err := h.s.poll(context.Background(), 0, time.Second)
+	body, next, err := pollOnce(context.Background(), h.s, 0, time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), next)
 	assert.NotEmpty(t, body)
@@ -1374,7 +1379,7 @@ func TestSessionPollTouches(t *testing.T) {
 	h := newTestSession(t, nil)
 	setActivity(h.s, time.Unix(1, 0))
 
-	_, _, err := h.s.poll(context.Background(), 0, 0)
+	_, _, err := pollOnce(context.Background(), h.s, 0, 0)
 	require.NoError(t, err)
 	assert.True(t, h.s.lastActivity().After(time.Unix(1, 0)))
 
@@ -1387,9 +1392,8 @@ func TestSessionPollTouches(t *testing.T) {
 func pollFrames(t *testing.T, s *session, cursor uint64) ([]Frame, uint64) {
 	t.Helper()
 
-	body, next, err := s.poll(context.Background(), cursor, time.Second)
+	body, next, err := pollOnce(context.Background(), s, cursor, time.Second)
 	require.NoError(t, err)
-	s.endDownload()
 
 	frames, err := ParseFrames(body, MaxFramePayload)
 	require.NoError(t, err)
@@ -1469,7 +1473,7 @@ func TestSessionPollAckWakesDownlinkPump(t *testing.T) {
 	require.Len(t, frames, 1)
 	assert.Equal(t, []byte("abc"), frames[0].Payload)
 
-	_, _, err = h.s.poll(context.Background(), next, 0)
+	_, _, err = pollOnce(context.Background(), h.s, next, 0)
 	require.NoError(t, err)
 
 	bs, items := h.sink.totals()
