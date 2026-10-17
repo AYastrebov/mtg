@@ -166,6 +166,7 @@ type e2eEnv struct {
 	handler *Handler
 	srv     *httptest.Server
 	rec     *eventRecorder
+	public  *recordingPublic
 	secrets []mtglib.Secret
 }
 
@@ -183,6 +184,7 @@ func newE2E(t *testing.T, o e2eOpts) *e2eEnv {
 
 	env := &e2eEnv{
 		rec:     &eventRecorder{},
+		public:  &recordingPublic{},
 		secrets: []mtglib.Secret{handlerSecret(1), handlerSecret(100)},
 	}
 
@@ -208,7 +210,7 @@ func newE2E(t *testing.T, o e2eOpts) *e2eEnv {
 		Hostname: testHostname,
 		Profiles: profiles,
 		Serve:    proxy.ServeWebConn,
-		Public:   &recordingPublic{},
+		Public:   env.public,
 		Timeouts: Timeouts{LongPoll: 2 * time.Second},
 	})
 	require.NoError(t, err)
@@ -385,12 +387,13 @@ func TestE2EBlocklistedClientGetsCloseNotPublic(t *testing.T) {
 	env := newE2E(t, e2eOpts{blocklist: ipSet{net.ParseIP(testXFF)}})
 	c := env.client(t, 0) // bridge and session creation succeed
 
-	s := c.openStream(1)
+	s := c.openStreamExpectReject(1)
 	waitServerClose(t, s)
 	assert.True(t, net.ParseIP(testXFF).Equal(waitFor[mtglib.EventIPBlocklisted](t, env.rec).RemoteIP))
 	assert.Empty(t, eventsOf[mtglib.EventClientMatched](env.rec))
 
 	assert.Equal(t, http.StatusNoContent, c.close())
+	assert.Zero(t, env.public.count(), "the public site saw a WEB proxy request")
 }
 
 func TestE2EPoolOverloadGetsClose(t *testing.T) {
@@ -401,11 +404,9 @@ func TestE2EPoolOverloadGetsClose(t *testing.T) {
 	data := randomPayload(t, 4<<10)
 	assertEcho(t, s1, data)
 
-	s2 := c.openStream(2)
+	s2 := c.openStreamExpectReject(2)
 	waitServerClose(t, s2)
 	waitFor[mtglib.EventConcurrencyLimited](t, env.rec)
-
-	require.NotEmpty(t, eventsOf[mtglib.EventConcurrencyLimited](env.rec))
 
 	s1.close()
 	waitFor[mtglib.EventFinish](t, env.rec)

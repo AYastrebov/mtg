@@ -95,14 +95,16 @@ func newBridgeClient(t *testing.T, baseURL, hostname, xff string, profileSecret 
 	return c
 }
 
-func (c *bridgeClient) request(method, path string, body []byte) *http.Request {
+func (c *bridgeClient) request(method, path string, body []byte) (*http.Request, error) {
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
 	}
 
 	req, err := http.NewRequestWithContext(c.ctx, method, c.baseURL+path, rd)
-	require.NoError(c.t, err)
+	if err != nil {
+		return nil, err //nolint: wrapcheck
+	}
 
 	req.Host = c.hostname
 	req.Header.Set("X-Forwarded-For", c.xff)
@@ -111,7 +113,7 @@ func (c *bridgeClient) request(method, path string, body []byte) *http.Request {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
-	return req
+	return req, nil
 }
 
 func (c *bridgeClient) do(req *http.Request) (*http.Response, []byte, error) {
@@ -132,8 +134,10 @@ func (c *bridgeClient) do(req *http.Request) (*http.Response, []byte, error) {
 func (c *bridgeClient) connect() {
 	c.t.Helper()
 
-	resp, page, err := c.do(c.request(http.MethodGet,
-		"/?bridge="+Capability(c.secret, c.hostname), nil))
+	req, err := c.request(http.MethodGet, "/?bridge="+Capability(c.secret, c.hostname), nil)
+	require.NoError(c.t, err)
+
+	resp, page, err := c.do(req)
 	require.NoError(c.t, err)
 	require.Equal(c.t, http.StatusOK, resp.StatusCode)
 
@@ -141,7 +145,8 @@ func (c *bridgeClient) connect() {
 	require.NotNil(c.t, m, "no bootstrap in the bridge page")
 
 	c.token = string(m[1])
-	req := c.request(http.MethodPost, "/api/v1/session", EncodeFrame(FrameHello, 0, []byte{1}))
+	req, err = c.request(http.MethodPost, "/api/v1/session", EncodeFrame(FrameHello, 0, []byte{1}))
+	require.NoError(c.t, err)
 	req.Header.Set("Content-Type", octetStream)
 
 	resp, body, err := c.do(req)
@@ -169,6 +174,24 @@ func (c *bridgeClient) openStream(id uint32) *clientStream {
 	require.NoError(c.t, err)
 
 	s.conn = conn
+
+	return s
+}
+
+// openStreamExpectReject opens a stream the server is expected to refuse at
+// OPEN: its CLOSE may arrive before the handshake is written, so a closed
+// stream is not an error here.
+func (c *bridgeClient) openStreamExpectReject(id uint32) *clientStream {
+	c.t.Helper()
+
+	s := c.openRawStream(id)
+
+	conn, err := obfuscation.Obfuscator{Secret: c.secret.Key[:]}.SendHandshake(s.conn, clientDC)
+	if err != nil {
+		require.ErrorIs(c.t, err, net.ErrClosed)
+	} else {
+		s.conn = conn
+	}
 
 	return s
 }
@@ -242,17 +265,19 @@ func (c *bridgeClient) isStopping() bool {
 	return c.stopping
 }
 
-// takeBatchLocked cuts whole frames, up to clientUpBatch bytes, off the outbox.
+// takeBatchLocked cuts whole frames, up to clientUpBatch bytes and
+// MaxBatchFrames frames, off the outbox.
 func (c *bridgeClient) takeBatchLocked() []byte {
-	size := 0
+	size, frames := 0, 0
 
-	for size < len(c.outbox) {
+	for size < len(c.outbox) && frames < MaxBatchFrames {
 		frameSize := FrameHeaderSize + int(binary.BigEndian.Uint32(c.outbox[size+4:size+FrameHeaderSize]))
 		if size > 0 && size+frameSize > clientUpBatch {
 			break
 		}
 
 		size += frameSize
+		frames++
 	}
 
 	batch := c.outbox[:size:size]
@@ -292,7 +317,13 @@ func (c *bridgeClient) upLoop() {
 // sendUp posts one batch, retrying it on 503.
 func (c *bridgeClient) sendUp(seq uint64, batch []byte) bool {
 	for {
-		req := c.request(http.MethodPost, "/api/v1/up", batch)
+		req, err := c.request(http.MethodPost, "/api/v1/up", batch)
+		if err != nil {
+			c.fail("up %d: %v", seq, err)
+
+			return false
+		}
+
 		req.Header.Set("Content-Type", octetStream)
 		req.Header.Set("X-Up-Seq", strconv.FormatUint(seq, 10))
 
@@ -327,7 +358,13 @@ func (c *bridgeClient) downLoop() {
 	cursor := "0"
 
 	for {
-		req := c.request(http.MethodPost, "/api/v1/down", nil)
+		req, err := c.request(http.MethodPost, "/api/v1/down", nil)
+		if err != nil {
+			c.fail("down %s: %v", cursor, err)
+
+			return
+		}
+
 		req.Header.Set("X-Down-Cursor", cursor)
 
 		resp, body, err := c.do(req)
