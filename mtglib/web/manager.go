@@ -103,10 +103,8 @@ type manager struct {
 func newManager(profiles []Profile, limits Limits, timeouts Timeouts, signer *tokenSigner,
 	serve serveFunc, logger mtglib.Logger, now func() time.Time,
 ) (*manager, error) {
-	if err := limits.validate(); err != nil {
-		return nil, err
-	}
-
+	// The global limits are validated once, by the handler's
+	// validateOptions; only the per-profile merge is checked here.
 	if signer == nil {
 		return nil, errors.New("token signer is required")
 	}
@@ -261,7 +259,7 @@ func (m *manager) createSession(bootstrap string, hello []byte, ip net.IP) (stri
 		return "", nil, fmt.Errorf("cannot issue session token: %w", err)
 	}
 
-	s := newSession(ps.profile, m.limits, m, m.serve, ip, m.rootLogger, m.now)
+	s := newSession(ps.profile, ps.limits, m, m.serve, ip, m.rootLogger, m.now)
 
 	m.sessions[sessHash] = &sessionEntry{
 		s:          s,

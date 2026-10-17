@@ -15,7 +15,9 @@ import (
 )
 
 // NewPublicUpstream returns a handler that reverse-proxies public traffic to
-// a local http upstream, keeping the incoming Host.
+// a local http upstream, keeping the incoming Host. The upstream gets
+// X-Forwarded-For (the inbound value with the peer appended),
+// X-Forwarded-Host and X-Forwarded-Proto.
 func NewPublicUpstream(target *url.URL) (http.Handler, error) {
 	if target == nil || target.Scheme != "http" {
 		return nil, errors.New("public upstream must use http scheme")
@@ -42,6 +44,8 @@ func NewPublicUpstream(target *url.URL) (http.Handler, error) {
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(&t)
 			pr.Out.Host = pr.In.Host
+			pr.Out.Header["X-Forwarded-For"] = pr.In.Header["X-Forwarded-For"]
+			pr.SetXForwarded()
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
 			w.WriteHeader(http.StatusBadGateway)

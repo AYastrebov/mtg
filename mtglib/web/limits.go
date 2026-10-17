@@ -276,6 +276,58 @@ func (b *rateBucket) take(now time.Time) bool {
 	return true
 }
 
+// withDefaults returns t with zero fields replaced by the defaults.
+func (t Timeouts) withDefaults() Timeouts {
+	defaults := DefaultTimeouts()
+
+	for _, f := range []struct {
+		value *time.Duration
+		def   time.Duration
+	}{
+		{&t.LongPoll, defaults.LongPoll},
+		{&t.ReconnectGrace, defaults.ReconnectGrace},
+		{&t.BootstrapLifetime, defaults.BootstrapLifetime},
+		{&t.Shutdown, defaults.Shutdown},
+	} {
+		if *f.value == 0 {
+			*f.value = f.def
+		}
+	}
+
+	return t
+}
+
+// ValidateTimeouts checks that t is consistent. A zero field means "use the
+// default" and is checked as the default value.
+func ValidateTimeouts(t Timeouts) error {
+	for _, f := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"LongPoll", t.LongPoll},
+		{"ReconnectGrace", t.ReconnectGrace},
+		{"BootstrapLifetime", t.BootstrapLifetime},
+		{"Shutdown", t.Shutdown},
+	} {
+		if f.value < 0 {
+			return fmt.Errorf("timeout %s is negative", f.name)
+		}
+	}
+
+	t = t.withDefaults()
+
+	if t.LongPoll < time.Second {
+		return errors.New("timeout LongPoll is below 1s")
+	}
+
+	// Otherwise the janitor may expire a session while its poll is parked.
+	if t.LongPoll >= t.ReconnectGrace {
+		return errors.New("timeout LongPoll must be below ReconnectGrace")
+	}
+
+	return nil
+}
+
 // ValidateLimits checks that l is consistent.
 func ValidateLimits(l Limits) error {
 	return l.validate()

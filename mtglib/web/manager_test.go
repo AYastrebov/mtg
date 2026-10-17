@@ -322,7 +322,7 @@ func TestManagerReconnectGrace(t *testing.T) {
 	_, fresh := h.create(t, testProfileIndex, testIP1)
 
 	h.clock.Advance(2 * time.Minute)
-	fresh.touch(h.clock.Now())
+	setActivity(fresh, h.clock.Now())
 
 	h.m.cleanup(h.clock.Now())
 

@@ -227,34 +227,11 @@ func validateOptions(opts *Options) error {
 }
 
 func applyTimeoutDefaults(t *Timeouts) error {
-	defaults := DefaultTimeouts()
-
-	for _, f := range []struct {
-		name  string
-		value *time.Duration
-		def   time.Duration
-	}{
-		{"LongPoll", &t.LongPoll, defaults.LongPoll},
-		{"ReconnectGrace", &t.ReconnectGrace, defaults.ReconnectGrace},
-		{"BootstrapLifetime", &t.BootstrapLifetime, defaults.BootstrapLifetime},
-		{"Shutdown", &t.Shutdown, defaults.Shutdown},
-	} {
-		switch {
-		case *f.value < 0:
-			return fmt.Errorf("%w: timeout %s is negative", ErrOptions, f.name)
-		case *f.value == 0:
-			*f.value = f.def
-		}
+	if err := ValidateTimeouts(*t); err != nil {
+		return fmt.Errorf("%w: %w", ErrOptions, err)
 	}
 
-	if t.LongPoll < time.Millisecond {
-		return fmt.Errorf("%w: timeout LongPoll is below 1ms", ErrOptions)
-	}
-
-	// Otherwise the janitor may expire a session while its poll is parked.
-	if t.LongPoll >= t.ReconnectGrace {
-		return fmt.Errorf("%w: timeout LongPoll must be below ReconnectGrace", ErrOptions)
-	}
+	*t = t.withDefaults()
 
 	return nil
 }

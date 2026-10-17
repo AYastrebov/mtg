@@ -35,6 +35,48 @@ func TestPublicUpstreamProxiesHostAndPath(t *testing.T) {
 	assert.Equal(t, "c=d", gotQuery)
 }
 
+func TestPublicUpstreamForwardedHeaders(t *testing.T) {
+	var got http.Header
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer up.Close()
+
+	u, _ := url.Parse(up.URL)
+	h, err := NewPublicUpstream(u)
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	send := func(xff string) {
+		req, err := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+		require.NoError(t, err)
+
+		req.Host = "site.example.org"
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+
+		resp, err := srv.Client().Do(req)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	}
+
+	send("203.0.113.7")
+	assert.Equal(t, []string{"203.0.113.7, 127.0.0.1"}, got.Values("X-Forwarded-For"))
+	assert.Equal(t, "site.example.org", got.Get("X-Forwarded-Host"))
+	assert.Equal(t, "http", got.Get("X-Forwarded-Proto"))
+
+	send("")
+	assert.Equal(t, []string{"127.0.0.1"}, got.Values("X-Forwarded-For"))
+	assert.Equal(t, "site.example.org", got.Get("X-Forwarded-Host"))
+	assert.Equal(t, "http", got.Get("X-Forwarded-Proto"))
+}
+
 func TestPublicUpstreamBadGateway(t *testing.T) {
 	u, _ := url.Parse("http://127.0.0.1:1")
 	h, err := NewPublicUpstream(u)

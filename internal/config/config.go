@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/netip"
 	"net/url"
-	"time"
 
 	"github.com/9seconds/mtg/v2/mtglib"
 	"github.com/9seconds/mtg/v2/mtglib/web"
@@ -105,20 +104,20 @@ type Config struct {
 		TrustedProxies []TypeCIDR    `json:"trustedProxies"`
 		TokenKey       TypeTokenKey  `json:"tokenKey"`
 		Limits         struct {
-			MaxSessions          TypeConcurrency `json:"maxSessions"`
-			MaxSessionsPerIP     TypeConcurrency `json:"maxSessionsPerIp"`
-			MaxStreams           TypeConcurrency `json:"maxStreams"`
-			MaxStreamsPerSession TypeConcurrency `json:"maxStreamsPerSession"`
+			MaxSessions          TypeCount `json:"maxSessions"`
+			MaxSessionsPerIP     TypeCount `json:"maxSessionsPerIp"`
+			MaxStreams           TypeCount `json:"maxStreams"`
+			MaxStreamsPerSession TypeCount `json:"maxStreamsPerSession"`
 
-			NewSessionsPerMinute TypeConcurrency `json:"newSessionsPerMinute"`
-			NewSessionsBurst     TypeConcurrency `json:"newSessionsBurst"`
-			NewStreamsPerMinute  TypeConcurrency `json:"newStreamsPerMinute"`
-			NewStreamsBurst      TypeConcurrency `json:"newStreamsBurst"`
+			NewSessionsPerMinute TypeCount `json:"newSessionsPerMinute"`
+			NewSessionsBurst     TypeCount `json:"newSessionsBurst"`
+			NewStreamsPerMinute  TypeCount `json:"newStreamsPerMinute"`
+			NewStreamsBurst      TypeCount `json:"newStreamsBurst"`
 
-			MaxBootstraps          TypeConcurrency `json:"maxBootstraps"`
-			MaxBootstrapsPerIP     TypeConcurrency `json:"maxBootstrapsPerIp"`
-			NewBootstrapsPerMinute TypeConcurrency `json:"newBootstrapsPerMinute"`
-			NewBootstrapsBurst     TypeConcurrency `json:"newBootstrapsBurst"`
+			MaxBootstraps          TypeCount `json:"maxBootstraps"`
+			MaxBootstrapsPerIP     TypeCount `json:"maxBootstrapsPerIp"`
+			NewBootstrapsPerMinute TypeCount `json:"newBootstrapsPerMinute"`
+			NewBootstrapsBurst     TypeCount `json:"newBootstrapsBurst"`
 
 			MaxPendingPerSession TypeBytes `json:"maxPendingPerSession"`
 			MaxPendingGlobal     TypeBytes `json:"maxPendingGlobal"`
@@ -177,10 +176,7 @@ func (c *Config) GetWebLimits() web.Limits {
 	l := web.DefaultLimits()
 	cl := &c.Web.Limits
 
-	count := func(dst *int, v TypeConcurrency) {
-		*dst = int(v.Get(uint(*dst)))
-	}
-	bigCount := func(dst *int, v TypeCount) {
+	count := func(dst *int, v TypeCount) {
 		*dst = int(v.Get(uint(*dst)))
 	}
 	size := func(dst *int, v TypeBytes) {
@@ -208,13 +204,13 @@ func (c *Config) GetWebLimits() web.Limits {
 	size64(&l.MaxPendingPerSession, cl.MaxPendingPerSession)
 	size64(&l.MaxPendingGlobal, cl.MaxPendingGlobal)
 
-	bigCount(&l.MaxPendingItemsPerSession, cl.MaxPendingItemsPerSession)
-	bigCount(&l.MaxPendingItemsGlobal, cl.MaxPendingItemsGlobal)
+	count(&l.MaxPendingItemsPerSession, cl.MaxPendingItemsPerSession)
+	count(&l.MaxPendingItemsGlobal, cl.MaxPendingItemsGlobal)
 
 	size(&l.CarrierBatchBytes, cl.CarrierBatchBytes)
 	size(&l.MaxBodyBytes, cl.MaxBodyBytes)
 	size(&l.MaxFramePayload, cl.MaxFramePayload)
-	bigCount(&l.MaxClosedStreamIDs, cl.MaxClosedStreamIDs)
+	count(&l.MaxClosedStreamIDs, cl.MaxClosedStreamIDs)
 
 	return l
 }
@@ -274,24 +270,8 @@ func (c *Config) validateWeb() error {
 		return fmt.Errorf("incorrect [web.limits]: %w", err)
 	}
 
-	timeouts := []struct {
-		name  string
-		value time.Duration
-	}{
-		{"long-poll", c.Web.Timeouts.LongPoll.Value},
-		{"reconnect-grace", c.Web.Timeouts.ReconnectGrace.Value},
-		{"bootstrap-lifetime", c.Web.Timeouts.BootstrapLifetime.Value},
-		{"shutdown", c.Web.Timeouts.Shutdown.Value},
-	}
-
-	for _, v := range timeouts {
-		if v.value < 0 {
-			return fmt.Errorf("web.timeouts.%s must not be negative", v.name)
-		}
-	}
-
-	if v := c.Web.Timeouts.LongPoll.Value; v != 0 && v < time.Second {
-		return fmt.Errorf("web.timeouts.long-poll must be at least 1s")
+	if err := web.ValidateTimeouts(c.GetWebTimeouts()); err != nil {
+		return fmt.Errorf("incorrect [web.timeouts]: %w", err)
 	}
 
 	return nil

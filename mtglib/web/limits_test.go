@@ -150,6 +150,21 @@ func TestTimeoutsLongPollBelowReconnectGrace(t *testing.T) {
 	assert.Equal(t, DefaultTimeouts(), to)
 }
 
+func TestValidateTimeouts(t *testing.T) {
+	require.NoError(t, ValidateTimeouts(Timeouts{}))
+	require.NoError(t, ValidateTimeouts(DefaultTimeouts()))
+	require.NoError(t, ValidateTimeouts(Timeouts{LongPoll: time.Second}))
+
+	for name, to := range map[string]Timeouts{
+		"negative":           {Shutdown: -time.Second},
+		"long poll below 1s": {LongPoll: 500 * time.Millisecond},
+		"long poll >= grace": {LongPoll: 3 * time.Minute},
+		"grace below poll":   {ReconnectGrace: 10 * time.Second},
+	} {
+		assert.Error(t, ValidateTimeouts(to), name)
+	}
+}
+
 func TestRateBucket(t *testing.T) {
 	now := time.Unix(1000, 0)
 	b := newRateBucket(60, 2, now)

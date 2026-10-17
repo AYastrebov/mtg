@@ -241,16 +241,31 @@ func dataFrames(s *session, id uint32) (frames []Frame, total int) {
 	return frames, total
 }
 
-// drainDownlink simulates Task 8's batch taker + ack: it pops every
-// pending item and releases its budget.
+// drainDownlink simulates the batch taker + ack: it pops every pending item
+// and acknowledges it through ackLocked, the one release path.
 func drainDownlink(s *session) {
 	s.mu.Lock()
-	items := s.popDownlinkLocked(len(s.downlink))
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 
-	for _, it := range items {
-		s.releaseDownlink(it.class, it.bytes, it.items)
-	}
+	s.unacked = append(s.unacked, s.popDownlinkLocked(len(s.downlink))...)
+	s.ackLocked()
+}
+
+// ackItems acknowledges items as if they were the last delivered batch.
+func ackItems(s *session, items ...*downItem) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.unacked = append(s.unacked, items...)
+	s.ackLocked()
+}
+
+// setActivity sets the session's last activity time.
+func setActivity(s *session, ts time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.activity = ts
 }
 
 func sendCredit(s *session, id uint32) int64 {
@@ -746,6 +761,77 @@ func TestSessionDownlinkCreditAndChunking(t *testing.T) {
 	assert.Zero(t, i[pendingDownlink])
 }
 
+func TestSessionCoalesceHonoursSessionFramePayload(t *testing.T) {
+	const payload = 64 << 10
+
+	h := newTestSession(t, func(l *Limits) { l.MaxFramePayload = payload })
+
+	_, err := h.s.processUp(1, openFrame(7))
+	require.NoError(t, err)
+
+	const total = 200 << 10
+
+	data := make([]byte, total)
+	for i := range data {
+		data[i] = byte(i)
+	}
+
+	_, err = h.serve.conn(t, 0).Write(data)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		_, got := dataFrames(h.s, 7)
+
+		return got == total
+	}, time.Second, time.Millisecond)
+
+	frames, _ := dataFrames(h.s, 7)
+	require.GreaterOrEqual(t, len(frames), (total+payload-1)/payload)
+
+	var joined []byte
+
+	for _, f := range frames {
+		assert.LessOrEqual(t, len(f.Payload), payload)
+		joined = append(joined, f.Payload...)
+	}
+
+	assert.Equal(t, data, joined)
+}
+
+// TestPipeZeroReadWaits pins the net.Pipe behaviour the downlink pump relies
+// on: a zero-length Read blocks until the peer writes and consumes nothing.
+func TestPipeZeroReadWaits(t *testing.T) {
+	a, b := net.Pipe()
+
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
+
+	ready := make(chan error, 1)
+
+	go func() {
+		_, err := b.Read(nil)
+		ready <- err
+	}()
+
+	select {
+	case <-ready:
+		t.Fatal("zero-length read must block until the peer writes")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	go func() { _, _ = a.Write([]byte("abc")) }()
+
+	require.NoError(t, <-ready)
+	assert.Equal(t, []byte("abc"), readN(t, b, 3))
+
+	require.NoError(t, a.Close())
+
+	_, err := b.Read(nil)
+	assert.ErrorIs(t, err, io.EOF)
+}
+
 func TestSessionDownlinkHeadroom(t *testing.T) {
 	h := newTestSession(t, nil)
 
@@ -772,7 +858,7 @@ func TestSessionDownlinkHeadroom(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	h.s.releaseDownlink(pendingDownlink, full, 0)
+	ackItems(h.s, &downItem{class: pendingDownlink, bytes: full})
 
 	select {
 	case err := <-written:
@@ -923,14 +1009,6 @@ func TestSessionCloseReleasesEverything(t *testing.T) {
 
 	_, err = h.s.processUp(3, openFrame(9))
 	require.ErrorIs(t, err, errSessionClosed)
-}
-
-func TestSessionTouch(t *testing.T) {
-	h := newTestSession(t, nil)
-
-	ts := time.Unix(1_000_000, 0)
-	h.s.touch(ts)
-	assert.Equal(t, ts, h.s.lastActivity())
 }
 
 func TestSessionDownlinkKeepsControlReserve(t *testing.T) {
@@ -1241,13 +1319,13 @@ func TestSessionPollSessionClosedWhileParked(t *testing.T) {
 
 func TestSessionPollTouches(t *testing.T) {
 	h := newTestSession(t, nil)
-	h.s.touch(time.Unix(1, 0))
+	setActivity(h.s, time.Unix(1, 0))
 
 	_, _, err := h.s.poll(context.Background(), 0, 0)
 	require.NoError(t, err)
 	assert.True(t, h.s.lastActivity().After(time.Unix(1, 0)))
 
-	h.s.touch(time.Unix(1, 0))
+	setActivity(h.s, time.Unix(1, 0))
 	_, err = h.s.processUp(1, openFrame(1))
 	require.NoError(t, err)
 	assert.True(t, h.s.lastActivity().After(time.Unix(1, 0)))

@@ -163,6 +163,7 @@ func (suite *ConfigTestSuite) TestConfigWebOverrides() {
 	suite.Equal(10, limits.MaxSessions)
 	suite.Equal(1<<20, limits.CarrierBatchBytes)
 	suite.Equal(300000, limits.MaxPendingItemsGlobal)
+	suite.Equal(100000, limits.NewStreamsPerMinute) // above the old 65535 cap
 	suite.Equal(defaults.MaxStreams, limits.MaxStreams)
 
 	timeouts := conf.GetWebTimeouts()
@@ -211,6 +212,11 @@ hostname = "web.example.com"
 public-upstream = "http://127.0.0.1:8080"
 [web.limits]
 carrier-batch-bytes = "100kib"`},
+		{"long poll above default reconnect grace", stageValidate, `
+hostname = "web.example.com"
+public-upstream = "http://127.0.0.1:8080"
+[web.timeouts]
+long-poll = "3m"`},
 	}
 
 	for _, tc := range testData {

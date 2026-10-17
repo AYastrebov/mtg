@@ -147,11 +147,10 @@ type session struct {
 	wg sync.WaitGroup
 }
 
+// newSession creates a session. limits are the profile's merged limits.
 func newSession(profile *Profile, limits Limits, sink budgetSink, serve serveFunc,
 	clientIP net.IP, logger mtglib.Logger, now func() time.Time,
 ) *session {
-	limits = limits.merge(profile.Limits)
-
 	return &session{
 		profile:        profile,
 		limits:         limits,
@@ -171,13 +170,6 @@ func newSession(profile *Profile, limits Limits, sink budgetSink, serve serveFun
 
 func (s *session) closed() <-chan struct{} {
 	return s.done
-}
-
-func (s *session) touch(now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.activity = now
 }
 
 func (s *session) lastActivity() time.Time {
@@ -330,19 +322,6 @@ func (s *session) releaseLocked(class pendingClass, bytes int64, items int) {
 	s.sink.changePending(class, -bytes, -items)
 }
 
-// releaseDownlink releases budget of downlink items that were delivered
-// (acknowledged by the client) and wakes downlink pumps.
-func (s *session) releaseDownlink(class pendingClass, bytes int64, items int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.releaseLocked(class, bytes, items)
-
-	for _, st := range s.streams {
-		wake(st.downWake)
-	}
-}
-
 // popDownlinkLocked removes the first n pending items. The caller keeps
 // them (and their budget) until they are acknowledged.
 func (s *session) popDownlinkLocked(n int) []*downItem {
@@ -426,7 +405,7 @@ func (s *session) queueDownlinkLocked(f Frame, class pendingClass) bool {
 
 // coalesceLocked merges f into an existing pending item: WINDOW into the
 // stream's pending WINDOW (sum), DATA into the last queued item if it is
-// DATA of the same stream (up to MaxFramePayload).
+// DATA of the same stream (up to limits.MaxFramePayload).
 func (s *session) coalesceLocked(f Frame) bool {
 	switch f.Type { //nolint: exhaustive
 	case FrameWindow:
@@ -452,7 +431,7 @@ func (s *session) coalesceLocked(f Frame) bool {
 
 		last := s.downlink[len(s.downlink)-1]
 		if last.sent || last.frame.Type != FrameData || last.frame.StreamID != f.StreamID ||
-			len(last.frame.Payload)+len(f.Payload) > MaxFramePayload {
+			len(last.frame.Payload)+len(f.Payload) > s.limits.MaxFramePayload {
 			return false
 		}
 
@@ -675,10 +654,18 @@ func (s *session) uplinkPump(st *stream) {
 	}
 }
 
+// downlinkBufPool holds DataChunk read buffers for the downlink pumps, so a
+// stream holds one only while it has data to read.
+var downlinkBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, DataChunk)
+
+		return &b
+	},
+}
+
 func (s *session) downlinkPump(st *stream) {
 	defer s.wg.Done()
-
-	buf := make([]byte, DataChunk)
 
 	for {
 		allowance, ok := s.downlinkAllowance(st)
@@ -686,8 +673,8 @@ func (s *session) downlinkPump(st *stream) {
 			return
 		}
 
-		k, err := st.sessionSide.Read(buf[:allowance])
-		if k > 0 && !s.queueStreamData(st, buf[:k]) {
+		queued, err := s.readDownlink(st, allowance)
+		if !queued {
 			return
 		}
 
@@ -699,6 +686,30 @@ func (s *session) downlinkPump(st *stream) {
 			return
 		}
 	}
+}
+
+// readDownlink reads up to allowance bytes from the stream and queues them.
+// It first waits for data with a zero-length read (sessionSide is a
+// net.Pipe end, whose Read blocks until the peer writes without consuming
+// anything when b is empty), so an idle stream holds no read buffer. The
+// buffer is pooled; queueDownlinkLocked copies the payload, so the queued
+// frame never aliases it. queued is false if the stream or session closed.
+func (s *session) readDownlink(st *stream, allowance int) (queued bool, err error) {
+	if _, err = st.sessionSide.Read(nil); err != nil {
+		return true, err
+	}
+
+	bp, _ := downlinkBufPool.Get().(*[]byte)
+	defer downlinkBufPool.Put(bp)
+
+	buf := (*bp)[:allowance]
+
+	k, err := st.sessionSide.Read(buf)
+	if k > 0 && !s.queueStreamData(st, buf[:k]) {
+		return false, err
+	}
+
+	return true, err
 }
 
 // downlinkAllowance blocks until the stream may read something; false if
