@@ -100,6 +100,35 @@ func TestLimitsPendingPerSessionMinimum(t *testing.T) {
 	assert.NoError(t, l.validate())
 }
 
+func TestLimitsPendingItemsPerSessionMinimum(t *testing.T) {
+	l := DefaultLimits()
+	assert.Equal(t, 4096, l.uplinkReserveItems())
+
+	minimum := l.controlReserveItems() + l.uplinkReserveItems() + 1
+	assert.Equal(t, minimum, l.minPendingItemsPerSession())
+
+	// 4096 - 400 - 4096 leaves no downlink item at all.
+	l.MaxPendingItemsPerSession = 4096
+	err := l.validate()
+	require.ErrorIs(t, err, ErrLimits)
+	assert.Contains(t, err.Error(), "MaxPendingItemsPerSession")
+	assert.Contains(t, err.Error(), strconv.Itoa(minimum))
+
+	l.MaxPendingItemsPerSession = minimum - 1
+	require.ErrorIs(t, l.validate(), ErrLimits)
+
+	l.MaxPendingItemsPerSession = minimum
+	require.NoError(t, l.validate())
+
+	s := &session{limits: l}
+	assert.Equal(t, l.uplinkReserveItems(), s.uplinkReserveItems())
+	assert.Equal(t, 1, s.downlinkItemsCap())
+
+	// A small body shrinks the uplink item reserve with it.
+	l.MaxBodyBytes = 8000
+	assert.Equal(t, 1000, l.uplinkReserveItems())
+}
+
 func TestNewManagerRejectsLowProfilePending(t *testing.T) {
 	g := DefaultLimits()
 	low := Profile{Index: 3, Secret: handlerSecret(7)}

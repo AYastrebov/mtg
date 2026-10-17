@@ -228,7 +228,7 @@ func (s *session) closeLocked() {
 // --- budgets ---------------------------------------------------------------
 
 func (s *session) uplinkReserveItems() int {
-	return min(s.limits.MaxBodyBytes/8, 4096) //nolint: mnd
+	return s.limits.uplinkReserveItems()
 }
 
 func (s *session) totalPendingLocked() (int64, int) {
@@ -785,8 +785,35 @@ type simStream struct {
 	window int64
 }
 
+// beginUpload takes the session's single uplink slot. It is taken before
+// the request body is read, so that one session never buffers more than one
+// uplink body at a time. Every successful call must be paired with
+// endUpload.
+func (s *session) beginUpload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch {
+	case s.isClosed:
+		return errSessionClosed
+	case s.upBusy:
+		return errConcurrent
+	}
+
+	s.upBusy = true
+
+	return nil
+}
+
+// endUpload releases the slot taken by beginUpload.
+func (s *session) endUpload() {
+	s.mu.Lock()
+	s.upBusy = false
+	s.mu.Unlock()
+}
+
 // processUp applies one uplink batch. It returns the acknowledged sequence
-// number.
+// number. The caller must hold the uplink slot (beginUpload).
 func (s *session) processUp(seq uint64, body []byte) (uint64, error) {
 	s.mu.Lock()
 
@@ -794,12 +821,6 @@ func (s *session) processUp(seq uint64, body []byte) (uint64, error) {
 		s.mu.Unlock()
 
 		return 0, errSessionClosed
-	}
-
-	if s.upBusy {
-		s.mu.Unlock()
-
-		return 0, errConcurrent
 	}
 
 	s.activity = s.now()
@@ -836,7 +857,6 @@ func (s *session) processUp(seq uint64, body []byte) (uint64, error) {
 		return 0, errBackpressure
 	}
 
-	s.upBusy = true
 	s.lastSeq = seq
 	s.lastDigest = digest
 
@@ -849,8 +869,6 @@ func (s *session) processUp(seq uint64, body []byte) (uint64, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.upBusy = false
 
 	if s.isClosed {
 		return 0, errSessionClosed

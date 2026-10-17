@@ -341,7 +341,7 @@ func TestManagerForgetsSelfClosedSession(t *testing.T) {
 
 	tok, s := h.create(t, testProfileIndex, testIP1)
 
-	_, err := s.processUp(0, nil) // protocol violation closes the session
+	_, err := uploadOnce(s, 0, nil) // protocol violation closes the session
 	require.Error(t, err)
 
 	_, ok := h.m.lookupSession(tok)
@@ -421,7 +421,7 @@ func TestManagerSessionUsesManagerBudget(t *testing.T) {
 	require.True(t, s.queueDownlink(Frame{Type: FrameClose, StreamID: 1}, pendingControl))
 	assert.Equal(t, int64(queueItemCost), h.m.stats().PendingBytes)
 
-	_, err := s.processUp(1, openFrame(5))
+	_, err := uploadOnce(s, 1, openFrame(5))
 	require.NoError(t, err)
 	assert.Equal(t, 1, h.m.stats().StreamsLive)
 
@@ -456,7 +456,7 @@ func TestSessionControlQueueOverflow(t *testing.T) {
 	require.Equal(t, maxControlItemsPerSession, flooder.controlItemsCap())
 
 	// The sibling has a live stream with a queued CLOSE of a refused OPEN.
-	_, err := sibling.processUp(1, batch(openFrame(1), openFrame(2)))
+	_, err := uploadOnce(sibling, 1, batch(openFrame(1), openFrame(2)))
 	require.NoError(t, err)
 	waitServed(t, h.serve, 1)
 
@@ -467,13 +467,13 @@ func TestSessionControlQueueOverflow(t *testing.T) {
 		frames = append(frames, openFrame(id+2))
 	}
 
-	_, err = flooder.processUp(1, batch(frames...))
+	_, err = uploadOnce(flooder, 1, batch(frames...))
 	require.NoError(t, err)
 	require.False(t, isClosed(flooder))
 	assert.Equal(t, maxControlItemsPerSession+1, h.m.stats().PendingItems)
 
 	// One more refused OPEN overflows the flooder's control queue.
-	_, err = flooder.processUp(2, batch(openFrame(5000)))
+	_, err = uploadOnce(flooder, 2, batch(openFrame(5000)))
 	require.ErrorIs(t, err, errSessionClosed)
 	assert.True(t, isClosed(flooder))
 

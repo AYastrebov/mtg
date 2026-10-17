@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -659,6 +661,43 @@ func TestSessionCreate503WhenFull(t *testing.T) {
 
 	// late DELETE of a closed session is still 204; an unknown one is 404
 	assert.Equal(t, http.StatusNoContent, hh.deleteSession(t, first).status)
+}
+
+func TestSessionDeleteMalformedChunkedBodyIs404(t *testing.T) {
+	t.Parallel()
+
+	hh := newHandlerHarness(t, nil)
+	token := hh.session(t, 0)
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(hh.srv.URL, "http://"))
+	require.NoError(t, err)
+
+	defer conn.Close() //nolint: errcheck
+
+	_, err = io.WriteString(conn, "DELETE /api/v1/session HTTP/1.1\r\n"+
+		"Host: "+testHostname+"\r\n"+
+		"X-Forwarded-For: "+testXFF+"\r\n"+
+		"Authorization: Bearer "+token+"\r\n"+
+		"Transfer-Encoding: chunked\r\n"+
+		"\r\n"+
+		"zz\r\n")
+	require.NoError(t, err)
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	assert.Empty(t, body)
+
+	// The session survived the malformed DELETE.
+	assert.Equal(t, 1, hh.h.Stats().SessionsLive)
+	assert.Equal(t, http.StatusNoContent, hh.up(t, token, "1", batch(openFrame(1))).status)
 }
 
 func TestSessionDeleteUnknownIs404(t *testing.T) {

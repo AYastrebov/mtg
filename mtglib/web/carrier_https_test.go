@@ -406,3 +406,116 @@ func TestHandleDownChunkedBodySetsDeadline(t *testing.T) {
 	c.handleDown(rec, downRequest("0", nil).WithContext(ctx2), h.s)
 	assert.Empty(t, rec.deadlines)
 }
+
+func TestHandleUpConcurrentIs503BeforeBodyIsRead(t *testing.T) {
+	c, h := newTestCarrier(t, nil)
+
+	pr, pw := io.Pipe()
+	slow := upRequest("1", octetStream, nil)
+	slow.Body = pr
+	slow.ContentLength = -1
+
+	slowRec := httptest.NewRecorder()
+	slowDone := make(chan struct{})
+
+	go func() {
+		defer close(slowDone)
+
+		c.handleUp(slowRec, slow, h.s)
+	}()
+
+	// Wait until the slow upload holds the slot (its body is still open).
+	require.Eventually(t, func() bool {
+		h.s.mu.Lock()
+		defer h.s.mu.Unlock()
+
+		return h.s.upBusy
+	}, 2*time.Second, time.Millisecond)
+
+	rec := httptest.NewRecorder()
+	c.handleUp(rec, upRequest("2", octetStream, batch(openFrame(8))), h.s)
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "1", rec.Header().Get("Retry-After"))
+	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+	assert.Equal(t, "0", rec.Header().Get("Content-Length"))
+
+	select {
+	case <-slowDone:
+		t.Fatal("the slow upload finished before its body was fed")
+	default:
+	}
+
+	_, err := pw.Write(batch(openFrame(7)))
+	require.NoError(t, err)
+	require.NoError(t, pw.Close())
+	<-slowDone
+
+	assert.Equal(t, http.StatusNoContent, slowRec.Code)
+	assert.Equal(t, "1", slowRec.Header().Get("X-Up-Ack"))
+
+	rec = httptest.NewRecorder()
+	c.handleUp(rec, upRequest("2", octetStream, batch(openFrame(8))), h.s)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Equal(t, "2", rec.Header().Get("X-Up-Ack"))
+}
+
+func TestHandleUpFailedBodyReleasesSlot(t *testing.T) {
+	c, h := newTestCarrier(t, nil)
+
+	pr, pw := io.Pipe()
+	r := upRequest("1", octetStream, nil)
+	r.Body = pr
+	r.ContentLength = -1
+
+	go func() {
+		body := batch(openFrame(7))
+		_, _ = pw.Write(body[:len(body)/2])
+		pw.CloseWithError(errors.New("client went away"))
+	}()
+
+	rec := httptest.NewRecorder()
+	c.handleUp(rec, r, h.s)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.False(t, isClosed(h.s))
+
+	rec = httptest.NewRecorder()
+	c.handleUp(rec, upRequest("1", octetStream, batch(openFrame(7))), h.s)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+}
+
+func TestHandleUpClosedSessionIs404(t *testing.T) {
+	c, h := newTestCarrier(t, nil)
+	h.s.close()
+
+	rec := httptest.NewRecorder()
+	c.handleUp(rec, upRequest("1", octetStream, batch(openFrame(7))), h.s)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// zeroReader returns no bytes and err on every read.
+type zeroReader struct{ err error }
+
+func (z zeroReader) Read([]byte) (int, error) { return 0, z.err }
+
+func TestEmptyBodyRequiresEOF(t *testing.T) {
+	assert.True(t, emptyBody(nil))
+	assert.True(t, emptyBody(http.NoBody))
+	assert.True(t, emptyBody(zeroReader{io.EOF}))
+	assert.True(t, emptyBody(bytes.NewReader(nil)))
+	assert.False(t, emptyBody(zeroReader{errors.New("reset")}))
+	assert.False(t, emptyBody(zeroReader{io.ErrUnexpectedEOF}))
+	assert.False(t, emptyBody(bytes.NewReader([]byte{0})))
+}
+
+func TestHandleDownBodyReadErrorIs404(t *testing.T) {
+	c, h := newTestCarrier(t, nil)
+
+	r := downRequest("0", []byte{})
+	r.ContentLength = -1
+	r.Body = io.NopCloser(zeroReader{errors.New("reset")})
+
+	rec := httptest.NewRecorder()
+	c.handleDown(rec, r, h.s)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.False(t, isClosed(h.s))
+}

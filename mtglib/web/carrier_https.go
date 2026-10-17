@@ -56,6 +56,22 @@ func (c *httpsCarrier) handleUp(w http.ResponseWriter, r *http.Request, s *sessi
 		return
 	}
 
+	// The uplink slot is taken before the body is read: a session buffers
+	// at most one uplink body at a time, and excess uploads are refused
+	// before they cost any memory.
+	switch err := s.beginUpload(); {
+	case errors.Is(err, errConcurrent):
+		retryLater(w)
+
+		return
+	case err != nil: // errSessionClosed
+		localNotFound(w)
+
+		return
+	}
+
+	defer s.endUpload()
+
 	if !armBodyDeadline(w) {
 		localNotFound(w)
 
@@ -76,12 +92,8 @@ func (c *httpsCarrier) handleUp(w http.ResponseWriter, r *http.Request, s *sessi
 	ack, err := s.processUp(seq, body)
 
 	switch {
-	case errors.Is(err, errBackpressure), errors.Is(err, errConcurrent):
-		h := w.Header()
-		h.Set("Cache-Control", "no-store")
-		h.Set("Retry-After", "1")
-		h.Set("Content-Length", "0")
-		w.WriteHeader(http.StatusServiceUnavailable)
+	case errors.Is(err, errBackpressure):
+		retryLater(w)
 
 		return
 	case err != nil: // errSessionProtocol, errSessionClosed
@@ -96,6 +108,15 @@ func (c *httpsCarrier) handleUp(w http.ResponseWriter, r *http.Request, s *sessi
 	h.Set("Cache-Control", "no-store")
 	h.Set("X-Up-Ack", strconv.FormatUint(ack, 10))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// retryLater answers an uplink that cannot be taken right now.
+func retryLater(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("Cache-Control", "no-store")
+	h.Set("Retry-After", "1")
+	h.Set("Content-Length", "0")
+	w.WriteHeader(http.StatusServiceUnavailable)
 }
 
 func (c *httpsCarrier) handleDown(w http.ResponseWriter, r *http.Request, s *session) {
@@ -156,7 +177,9 @@ func (c *httpsCarrier) handleWS(w http.ResponseWriter, _ *http.Request, _ *sessi
 	localNotFound(w)
 }
 
-// emptyBody reports whether a request body has no bytes at all.
+// emptyBody reports whether a request body has no bytes at all. Only a
+// read that ends with EOF proves it: a zero-byte read failing otherwise
+// (a deadline, a reset, a malformed chunked body) is not an empty body.
 func emptyBody(body io.Reader) bool {
 	if body == nil || body == http.NoBody {
 		return true
@@ -164,7 +187,7 @@ func emptyBody(body io.Reader) bool {
 
 	var one [1]byte
 
-	n, _ := io.ReadFull(body, one[:])
+	n, err := io.ReadFull(body, one[:])
 
-	return n == 0
+	return n == 0 && errors.Is(err, io.EOF)
 }

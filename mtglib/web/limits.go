@@ -54,7 +54,11 @@ type Limits struct {
 	MaxPendingItemsPerSession int
 	MaxPendingItemsGlobal     int
 
-	CarrierBatchBytes  int
+	CarrierBatchBytes int
+	// MaxBodyBytes caps one uplink request body. A session reads at most
+	// one uplink body at a time, so in-flight upload memory is bounded by
+	// MaxSessions × MaxBodyBytes (a session create reads only a hello of
+	// at most maxHelloBytes).
 	MaxBodyBytes       int
 	MaxFramePayload    int
 	MaxClosedStreamIDs int
@@ -132,8 +136,13 @@ func (l Limits) controlReserveBytes() int64 {
 	return int64(l.controlReserveItems()) * (queueItemCost + FrameHeaderSize + 4)
 }
 
+// uplinkReserveItems is how many items one uplink body can queue at most.
+func (l Limits) uplinkReserveItems() int {
+	return min(l.MaxBodyBytes/8, MaxBatchFrames)
+}
+
 func (l Limits) uplinkReserveBytes() int64 {
-	return int64(l.MaxBodyBytes) + int64(min(l.MaxBodyBytes/8, 4096))*queueItemCost
+	return int64(l.MaxBodyBytes) + int64(l.uplinkReserveItems())*queueItemCost
 }
 
 func (l Limits) validate() error {
@@ -207,13 +216,26 @@ func (l Limits) minPendingPerSession() int64 {
 	return l.controlReserveBytes() + l.uplinkReserveBytes() + minDownlinkBytes
 }
 
-// validateSessionBudget checks the per-session byte budget. It must hold for
-// the global limits and for every profile's merged limits.
+// minPendingItemsPerSession is the smallest MaxPendingItemsPerSession that
+// leaves the downlink at least one item beside the control and uplink
+// reserves. With less, no downlink DATA can ever be queued.
+func (l Limits) minPendingItemsPerSession() int {
+	return l.controlReserveItems() + l.uplinkReserveItems() + 1
+}
+
+// validateSessionBudget checks the per-session byte and item budgets. It
+// must hold for the global limits and for every profile's merged limits.
 func (l Limits) validateSessionBudget() error {
 	if minimum := l.minPendingPerSession(); l.MaxPendingPerSession < minimum {
 		return fmt.Errorf("%w: MaxPendingPerSession %d is below the minimum %d "+
 			"(control and uplink reserves plus 1 MiB of downlink)",
 			ErrLimits, l.MaxPendingPerSession, minimum)
+	}
+
+	if minimum := l.minPendingItemsPerSession(); l.MaxPendingItemsPerSession < minimum {
+		return fmt.Errorf("%w: MaxPendingItemsPerSession %d is below the minimum %d "+
+			"(control and uplink item reserves plus 1 downlink item)",
+			ErrLimits, l.MaxPendingItemsPerSession, minimum)
 	}
 
 	return nil

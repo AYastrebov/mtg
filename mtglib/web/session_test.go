@@ -315,13 +315,13 @@ func assertNoRead(t *testing.T, c net.Conn) {
 func TestSessionOpenServesStream(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	ack, err := h.s.processUp(1, openFrame(7))
+	ack, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, ack)
 	require.Equal(t, 1, h.serve.count())
 	assert.Equal(t, []int{testProfileIndex}, h.serve.idx)
 
-	ack, err = h.s.processUp(2, dataFrame(7, []byte("abc")))
+	ack, err = uploadOnce(h.s, 2, dataFrame(7, []byte("abc")))
 	require.NoError(t, err)
 	assert.EqualValues(t, 2, ack)
 
@@ -339,13 +339,13 @@ func TestSessionOpenServesStream(t *testing.T) {
 func TestSessionRetryIdempotent(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	body := dataFrame(7, []byte("abc"))
 
 	for range 2 {
-		ack, err := h.s.processUp(2, body)
+		ack, err := uploadOnce(h.s, 2, body)
 		require.NoError(t, err)
 		assert.EqualValues(t, 2, ack)
 	}
@@ -354,7 +354,7 @@ func TestSessionRetryIdempotent(t *testing.T) {
 	assert.Equal(t, "abc", string(readN(t, conn, 3)))
 	assertNoRead(t, conn)
 
-	_, err = h.s.processUp(2, dataFrame(7, []byte("xyz")))
+	_, err = uploadOnce(h.s, 2, dataFrame(7, []byte("xyz")))
 	require.ErrorIs(t, err, errSessionProtocol)
 
 	select {
@@ -363,22 +363,22 @@ func TestSessionRetryIdempotent(t *testing.T) {
 		t.Fatal("session is not closed")
 	}
 
-	_, err = h.s.processUp(3, dataFrame(7, []byte("xyz")))
+	_, err = uploadOnce(h.s, 3, dataFrame(7, []byte("xyz")))
 	require.ErrorIs(t, err, errSessionClosed)
 }
 
 func TestSessionSequenceErrors(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
-	_, err = h.s.processUp(3, openFrame(8))
+	_, err = uploadOnce(h.s, 3, openFrame(8))
 	require.ErrorIs(t, err, errSessionProtocol)
 	assert.True(t, isClosed(h.s))
 
 	h2 := newTestSession(t, nil)
-	_, err = h2.s.processUp(0, openFrame(7))
+	_, err = uploadOnce(h2.s, 0, openFrame(7))
 	require.ErrorIs(t, err, errSessionProtocol)
 	assert.True(t, isClosed(h2.s))
 }
@@ -393,7 +393,7 @@ func TestSessionMalformedBatchIsProtocolError(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newTestSession(t, nil)
-			_, err := h.s.processUp(1, body)
+			_, err := uploadOnce(h.s, 1, body)
 			require.ErrorIs(t, err, errSessionProtocol)
 			assert.True(t, isClosed(h.s))
 		})
@@ -403,7 +403,7 @@ func TestSessionMalformedBatchIsProtocolError(t *testing.T) {
 func TestSessionWindowExceeded(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	chunk := make([]byte, MaxFramePayload)
@@ -415,7 +415,7 @@ func TestSessionWindowExceeded(t *testing.T) {
 
 	frames = append(frames, dataFrame(7, []byte{1}))
 
-	_, err = h.s.processUp(2, batch(frames...))
+	_, err = uploadOnce(h.s, 2, batch(frames...))
 	require.ErrorIs(t, err, errSessionProtocol)
 	assert.True(t, isClosed(h.s))
 
@@ -433,7 +433,7 @@ func TestSessionWindowExceeded(t *testing.T) {
 func TestSessionWindowExactlyFits(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	chunk := make([]byte, MaxFramePayload)
@@ -443,11 +443,11 @@ func TestSessionWindowExactlyFits(t *testing.T) {
 		frames = append(frames, dataFrame(7, chunk))
 	}
 
-	_, err = h.s.processUp(2, batch(frames...))
+	_, err = uploadOnce(h.s, 2, batch(frames...))
 	require.NoError(t, err)
 
 	// The window is exhausted until the proxy side consumes data.
-	_, err = h.s.processUp(3, dataFrame(7, []byte{1}))
+	_, err = uploadOnce(h.s, 3, dataFrame(7, []byte{1}))
 	require.ErrorIs(t, err, errSessionProtocol)
 }
 
@@ -459,7 +459,7 @@ func TestSessionUnknownStreamIsProtocolError(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newTestSession(t, nil)
-			_, err := h.s.processUp(1, body)
+			_, err := uploadOnce(h.s, 1, body)
 			require.ErrorIs(t, err, errSessionProtocol)
 			assert.True(t, isClosed(h.s))
 		})
@@ -470,7 +470,7 @@ func TestSessionValidationIsAtomic(t *testing.T) {
 	h := newTestSession(t, nil)
 
 	// OPEN 7 is valid but DATA 9 is not: nothing must be applied.
-	_, err := h.s.processUp(1, batch(openFrame(7), dataFrame(9, []byte("x"))))
+	_, err := uploadOnce(h.s, 1, batch(openFrame(7), dataFrame(9, []byte("x"))))
 	require.ErrorIs(t, err, errSessionProtocol)
 	assert.Equal(t, 0, h.serve.count())
 
@@ -481,10 +481,10 @@ func TestSessionValidationIsAtomic(t *testing.T) {
 func TestSessionTombstoneSilences(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
-	_, err = h.s.processUp(2, closeFrame(7))
+	_, err = uploadOnce(h.s, 2, closeFrame(7))
 	require.NoError(t, err)
 
 	conn := h.serve.conn(t, 0)
@@ -496,7 +496,7 @@ func TestSessionTombstoneSilences(t *testing.T) {
 	assert.Equal(t, 1, released)
 	assert.False(t, hasFrame(h.s, FrameClose, 7), "client CLOSE must not be echoed")
 
-	ack, err := h.s.processUp(3, batch(dataFrame(7, []byte("x")), windowFrame(7, 5), closeFrame(7)))
+	ack, err := uploadOnce(h.s, 3, batch(dataFrame(7, []byte("x")), windowFrame(7, 5), closeFrame(7)))
 	require.NoError(t, err)
 	assert.EqualValues(t, 3, ack)
 	assert.False(t, isClosed(h.s))
@@ -505,14 +505,14 @@ func TestSessionTombstoneSilences(t *testing.T) {
 	assert.Zero(t, b[pendingUplink])
 	assert.Zero(t, i[pendingUplink])
 
-	_, err = h.s.processUp(4, openFrame(7))
+	_, err = uploadOnce(h.s, 4, openFrame(7))
 	require.ErrorIs(t, err, errSessionProtocol)
 }
 
 func TestSessionTombstoneRing(t *testing.T) {
 	h := newTestSession(t, func(l *Limits) { l.MaxClosedStreamIDs = 2 })
 
-	_, err := h.s.processUp(1, batch(openFrame(1), closeFrame(1), openFrame(2), closeFrame(2),
+	_, err := uploadOnce(h.s, 1, batch(openFrame(1), closeFrame(1), openFrame(2), closeFrame(2),
 		openFrame(3), closeFrame(3)))
 	require.NoError(t, err)
 
@@ -524,7 +524,7 @@ func TestSessionTombstoneRing(t *testing.T) {
 	assert.Equal(t, 3, released)
 
 	// id 1 was evicted from the ring: it is unknown again.
-	_, err = h.s.processUp(2, batch(dataFrame(3, []byte("x")), openFrame(1)))
+	_, err = uploadOnce(h.s, 2, batch(dataFrame(3, []byte("x")), openFrame(1)))
 	require.NoError(t, err)
 	assert.Equal(t, 1, h.serve.count())
 }
@@ -532,11 +532,11 @@ func TestSessionTombstoneRing(t *testing.T) {
 func TestSessionOpenAndCloseInOneBatch(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, batch(openFrame(7), dataFrame(7, []byte("x")), closeFrame(7),
+	_, err := uploadOnce(h.s, 1, batch(openFrame(7), dataFrame(7, []byte("x")), closeFrame(7),
 		dataFrame(7, []byte("y"))))
 	require.NoError(t, err)
 
-	_, err = h.s.processUp(2, openFrame(7))
+	_, err = uploadOnce(h.s, 2, openFrame(7))
 	require.ErrorIs(t, err, errSessionProtocol)
 }
 
@@ -545,7 +545,7 @@ func TestSessionOpenRefusedGetsClose(t *testing.T) {
 		h := newTestSession(t, nil)
 		h.sink.setRefuseAcquire(true)
 
-		ack, err := h.s.processUp(1, batch(openFrame(7), dataFrame(7, []byte("x"))))
+		ack, err := uploadOnce(h.s, 1, batch(openFrame(7), dataFrame(7, []byte("x"))))
 		require.NoError(t, err)
 		assert.EqualValues(t, 1, ack)
 		assert.True(t, hasFrame(h.s, FrameClose, 7))
@@ -559,14 +559,14 @@ func TestSessionOpenRefusedGetsClose(t *testing.T) {
 		assert.Equal(t, 1, i[pendingControl])
 
 		// The refused id is tombstoned.
-		_, err = h.s.processUp(2, openFrame(7))
+		_, err = uploadOnce(h.s, 2, openFrame(7))
 		require.ErrorIs(t, err, errSessionProtocol)
 	})
 
 	t.Run("per session", func(t *testing.T) {
 		h := newTestSession(t, func(l *Limits) { l.MaxStreamsPerSession = 1 })
 
-		_, err := h.s.processUp(1, batch(openFrame(7), openFrame(8)))
+		_, err := uploadOnce(h.s, 1, batch(openFrame(7), openFrame(8)))
 		require.NoError(t, err)
 		assert.Equal(t, 1, h.serve.count())
 		assert.True(t, hasFrame(h.s, FrameClose, 8))
@@ -578,7 +578,7 @@ func TestSessionOpenRefusedGetsClose(t *testing.T) {
 		h := newTestSession(t, nil)
 		h.serve.err = errFakeServe
 
-		_, err := h.s.processUp(1, openFrame(7))
+		_, err := uploadOnce(h.s, 1, openFrame(7))
 		require.NoError(t, err)
 		assert.True(t, hasFrame(h.s, FrameClose, 7))
 
@@ -587,7 +587,7 @@ func TestSessionOpenRefusedGetsClose(t *testing.T) {
 		assert.Equal(t, 1, released)
 		assert.False(t, isClosed(h.s))
 
-		_, err = h.s.processUp(2, dataFrame(7, []byte("x")))
+		_, err = uploadOnce(h.s, 2, dataFrame(7, []byte("x")))
 		require.NoError(t, err)
 	})
 
@@ -596,7 +596,7 @@ func TestSessionOpenRefusedGetsClose(t *testing.T) {
 		h.sink.setRefuseAcquire(true)
 		h.sink.setRefuse(pendingControl, true)
 
-		_, err := h.s.processUp(1, openFrame(7))
+		_, err := uploadOnce(h.s, 1, openFrame(7))
 		require.ErrorIs(t, err, errSessionClosed)
 		assert.True(t, isClosed(h.s))
 	})
@@ -605,13 +605,13 @@ func TestSessionOpenRefusedGetsClose(t *testing.T) {
 func TestSessionBackpressure503(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	h.sink.setRefuse(pendingUplink, true)
 
 	body := dataFrame(7, []byte("abc"))
-	_, err = h.s.processUp(2, body)
+	_, err = uploadOnce(h.s, 2, body)
 	require.ErrorIs(t, err, errBackpressure)
 	assert.False(t, isClosed(h.s))
 
@@ -626,7 +626,7 @@ func TestSessionBackpressure503(t *testing.T) {
 
 	h.sink.setRefuse(pendingUplink, false)
 
-	ack, err := h.s.processUp(2, body)
+	ack, err := uploadOnce(h.s, 2, body)
 	require.NoError(t, err)
 	assert.EqualValues(t, 2, ack)
 	assert.Equal(t, "abc", string(readN(t, conn, 3)))
@@ -635,7 +635,7 @@ func TestSessionBackpressure503(t *testing.T) {
 func TestSessionBackpressureSessionBudget(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	limits := h.s.limits
@@ -644,7 +644,7 @@ func TestSessionBackpressureSessionBudget(t *testing.T) {
 	h.s.pendingBytes[pendingDownlink] = limits.MaxPendingPerSession - limits.controlReserveBytes() - 10
 	h.s.mu.Unlock()
 
-	_, err = h.s.processUp(2, dataFrame(7, []byte("abc")))
+	_, err = uploadOnce(h.s, 2, dataFrame(7, []byte("abc")))
 	require.ErrorIs(t, err, errBackpressure)
 
 	h.s.mu.Lock()
@@ -660,24 +660,52 @@ func TestSessionConcurrentUp(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := h.s.processUp(1, openFrame(7))
+		_, err := uploadOnce(h.s, 1, openFrame(7))
 		done <- err
 	}()
 
 	<-h.serve.entered
 
-	_, err := h.s.processUp(2, openFrame(8))
+	_, err := uploadOnce(h.s, 2, openFrame(8))
 	require.ErrorIs(t, err, errConcurrent)
 	assert.False(t, isClosed(h.s))
 
 	close(h.serve.block)
 	require.NoError(t, <-done)
+
+	// The slot is free again.
+	_, err = uploadOnce(h.s, 2, openFrame(8))
+	require.NoError(t, err)
+}
+
+func TestSessionUploadSlot(t *testing.T) {
+	h := newTestSession(t, nil)
+
+	require.NoError(t, h.s.beginUpload())
+	require.ErrorIs(t, h.s.beginUpload(), errConcurrent)
+	h.s.endUpload()
+	require.NoError(t, h.s.beginUpload())
+	h.s.endUpload()
+
+	h.s.close()
+	require.ErrorIs(t, h.s.beginUpload(), errSessionClosed)
+}
+
+// uploadOnce runs processUp holding the uplink slot, as handleUp does.
+func uploadOnce(s *session, seq uint64, body []byte) (uint64, error) {
+	if err := s.beginUpload(); err != nil {
+		return 0, err
+	}
+
+	defer s.endUpload()
+
+	return s.processUp(seq, body)
 }
 
 func TestSessionDownlinkCreditAndChunking(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	conn := h.serve.conn(t, 0)
@@ -737,7 +765,7 @@ func TestSessionDownlinkCreditAndChunking(t *testing.T) {
 	_, total := dataFrames(h.s, 7)
 	assert.Equal(t, InitialStreamWindow, total)
 
-	_, err = h.s.processUp(2, windowFrame(7, 100))
+	_, err = uploadOnce(h.s, 2, windowFrame(7, 100))
 	require.NoError(t, err)
 
 	select {
@@ -766,7 +794,7 @@ func TestSessionCoalesceHonoursSessionFramePayload(t *testing.T) {
 
 	h := newTestSession(t, func(l *Limits) { l.MaxFramePayload = payload })
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	const total = 200 << 10
@@ -835,7 +863,7 @@ func TestPipeZeroReadWaits(t *testing.T) {
 func TestSessionDownlinkHeadroom(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	h.s.mu.Lock()
@@ -871,7 +899,7 @@ func TestSessionDownlinkHeadroom(t *testing.T) {
 func TestSessionGlobalDownlinkRefusalRetries(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	h.sink.setRefuse(pendingDownlink, true)
@@ -898,7 +926,7 @@ func TestSessionGlobalDownlinkRefusalRetries(t *testing.T) {
 func TestSessionWindowCoalesces(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	frames := make([][]byte, 0, 100)
@@ -906,7 +934,7 @@ func TestSessionWindowCoalesces(t *testing.T) {
 		frames = append(frames, dataFrame(7, []byte("ab")))
 	}
 
-	_, err = h.s.processUp(2, batch(frames...))
+	_, err = uploadOnce(h.s, 2, batch(frames...))
 	require.NoError(t, err)
 
 	readN(t, h.serve.conn(t, 0), 200)
@@ -932,7 +960,7 @@ func TestSessionWindowCoalesces(t *testing.T) {
 func TestSessionProxyCloseEmitsClose(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	require.NoError(t, h.serve.conn(t, 0).Close())
@@ -954,18 +982,18 @@ func TestSessionProxyCloseEmitsClose(t *testing.T) {
 	assert.Equal(t, 1, count)
 
 	// The stream is tombstoned: late client frames are silently accepted.
-	_, err = h.s.processUp(2, dataFrame(7, []byte("x")))
+	_, err = uploadOnce(h.s, 2, dataFrame(7, []byte("x")))
 	require.NoError(t, err)
 }
 
 func TestSessionCloseReleasesEverything(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, batch(openFrame(7), openFrame(8)))
+	_, err := uploadOnce(h.s, 1, batch(openFrame(7), openFrame(8)))
 	require.NoError(t, err)
 
 	// Uplink pending: the proxy side of 7 never reads.
-	_, err = h.s.processUp(2, batch(dataFrame(7, make([]byte, 1000)), dataFrame(7, []byte("x"))))
+	_, err = uploadOnce(h.s, 2, batch(dataFrame(7, make([]byte, 1000)), dataFrame(7, []byte("x"))))
 	require.NoError(t, err)
 
 	// Downlink pending.
@@ -1007,14 +1035,14 @@ func TestSessionCloseReleasesEverything(t *testing.T) {
 	assert.False(t, h.s.queueDownlink(Frame{Type: FrameClose, StreamID: 7}, pendingControl))
 	assert.Empty(t, pendingFrames(h.s))
 
-	_, err = h.s.processUp(3, openFrame(9))
+	_, err = uploadOnce(h.s, 3, openFrame(9))
 	require.ErrorIs(t, err, errSessionClosed)
 }
 
 func TestSessionDownlinkKeepsControlReserve(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, batch(openFrame(7), openFrame(8)))
+	_, err := uploadOnce(h.s, 1, batch(openFrame(7), openFrame(8)))
 	require.NoError(t, err)
 
 	limits := h.s.limits
@@ -1051,7 +1079,7 @@ func TestSessionDownlinkKeepsControlReserve(t *testing.T) {
 func TestSessionClientCloseDropsDownlink(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	conn := h.serve.conn(t, 0)
@@ -1059,7 +1087,7 @@ func TestSessionClientCloseDropsDownlink(t *testing.T) {
 	_, err = conn.Write([]byte("hello"))
 	require.NoError(t, err)
 
-	_, err = h.s.processUp(2, dataFrame(7, []byte("ab")))
+	_, err = uploadOnce(h.s, 2, dataFrame(7, []byte("ab")))
 	require.NoError(t, err)
 	readN(t, conn, 2)
 
@@ -1069,7 +1097,7 @@ func TestSessionClientCloseDropsDownlink(t *testing.T) {
 		return total == 5 && windowSum(h.s, 7) == 2
 	}, time.Second, time.Millisecond)
 
-	_, err = h.s.processUp(3, closeFrame(7))
+	_, err = uploadOnce(h.s, 3, closeFrame(7))
 	require.NoError(t, err)
 
 	for _, f := range pendingFrames(h.s) {
@@ -1091,7 +1119,7 @@ func TestSessionClientCloseDropsDownlink(t *testing.T) {
 func TestSessionProxyCloseKeepsDownlink(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	conn := h.serve.conn(t, 0)
@@ -1326,7 +1354,7 @@ func TestSessionPollTouches(t *testing.T) {
 	assert.True(t, h.s.lastActivity().After(time.Unix(1, 0)))
 
 	setActivity(h.s, time.Unix(1, 0))
-	_, err = h.s.processUp(1, openFrame(1))
+	_, err = uploadOnce(h.s, 1, openFrame(1))
 	require.NoError(t, err)
 	assert.True(t, h.s.lastActivity().After(time.Unix(1, 0)))
 }
@@ -1402,7 +1430,7 @@ func TestSessionBatchLimits(t *testing.T) {
 func TestSessionPollAckWakesDownlinkPump(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := h.s.processUp(1, openFrame(7))
+	_, err := uploadOnce(h.s, 1, openFrame(7))
 	require.NoError(t, err)
 
 	proxy := h.serve.conn(t, 0)
