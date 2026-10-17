@@ -19,6 +19,8 @@ const (
 	tokenMACSize     = 16
 	tokenKeySize     = 32
 
+	tokenFilterBlockSize = aes.BlockSize
+
 	tokenKeyLabel    = "mtg-web-token-key-v1"
 	tokenMACLabel    = "tproxy-server-token-v1\x00"
 	tokenFilterLabel = "tproxy-server-token-filter-v1\x00"
@@ -73,6 +75,20 @@ func (s *tokenSigner) tag(nonce []byte) []byte {
 	s.filter.Encrypt(out[:], in[:])
 
 	return out[:tokenTagSize]
+}
+
+// tagMatches reports whether raw carries the filter tag of its nonce, like
+// classify does first, but without allocating: scratch must hold at least
+// 2*tokenFilterBlockSize bytes.
+func (s *tokenSigner) tagMatches(raw, scratch []byte) bool {
+	in := scratch[:tokenFilterBlockSize]
+	out := scratch[tokenFilterBlockSize : 2*tokenFilterBlockSize]
+
+	clear(in)
+	copy(in, raw[:tokenNonceSize])
+	s.filter.Encrypt(out, in)
+
+	return subtle.ConstantTimeCompare(out[:tokenTagSize], raw[tokenNonceSize:tokenNonceSize+tokenTagSize]) == 1
 }
 
 func (s *tokenSigner) mac(kind tokenKind, prefix []byte) []byte {

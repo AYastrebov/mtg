@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"net/http"
+	"strings"
 )
 
 // secretScanner detects tokens and capabilities in an HTTP request.
@@ -64,6 +65,10 @@ func (s *secretScanner) scan(input string) bool {
 		return true
 	}
 
+	if strings.IndexByte(input, '%') < 0 {
+		return false // nothing to unescape
+	}
+
 	decoded := lenientUnescape(input)
 
 	return decoded != input && s.scanString(decoded)
@@ -120,23 +125,70 @@ func (s *secretScanner) scanString(input string) bool {
 	return false
 }
 
+// scanRun reports whether any window of tokenEncodedSize chars of run (a
+// run of base64url chars) decodes to an authentic token or a capability.
+//
+// It does not decode every window on its own. Let a window start at offset
+// i = a + 4j with a = i mod 4. Its first 40 chars are whole quads, which
+// decode to the same 30 bytes as at [3j, 3j+30) in the decoding of run[a:].
+// Its last 3 chars are the first 3 chars of the next quad, and the first 2
+// bytes of a quad depend on those 3 chars only, so the window decodes to
+// exactly run[a:]-decoded[3j : 3j+32]. The lenient (non-strict) decoder
+// ignores the padding bits of a lone window's last char just as they are
+// ignored, being bits of the next byte, inside a whole quad. Hence the run
+// is decoded once per alignment and each window is a 32-byte slice of that.
 func (s *secretScanner) scanRun(run string) bool {
-	for i := 0; i+tokenEncodedSize <= len(run); i++ {
-		raw, err := base64.RawURLEncoding.DecodeString(run[i : i+tokenEncodedSize])
+	src := []byte(run)
+	dst := make([]byte, base64.RawURLEncoding.DecodedLen(len(src)))
+	scratch := make([]byte, 2*tokenFilterBlockSize)
+
+	for align := 0; align < 4 && align+tokenEncodedSize <= len(src); align++ {
+		part := src[align:]
+		if len(part)%4 == 1 {
+			// A lone char of a final quad is not decodable, and no window
+			// of this alignment ends on it.
+			part = part[:len(part)-1]
+		}
+
+		n, err := base64.RawURLEncoding.Decode(dst, part)
 		if err != nil {
-			continue
+			continue // cannot happen: run holds base64url chars only
 		}
 
-		if _, _, ok := s.signer.classify(raw); ok {
-			return true
-		}
-
-		for _, c := range s.capabilities {
-			if subtle.ConstantTimeCompare(raw, c) == 1 {
+		// off+32 <= n holds exactly when the window at align+off/3*4 fits
+		// into run.
+		for off := 0; off+tokenRawSize <= n; off += 3 {
+			if s.matches(dst[off:off+tokenRawSize], scratch) {
 				return true
 			}
 		}
 	}
 
 	return false
+}
+
+// matches reports whether raw (32 bytes) is a capability or an authentic
+// token. scratch is a reusable buffer for the token filter.
+func (s *secretScanner) matches(raw, scratch []byte) bool {
+	found := false
+
+	for _, c := range s.capabilities {
+		if subtle.ConstantTimeCompare(raw, c) == 1 {
+			found = true
+		}
+	}
+
+	if found {
+		return true
+	}
+
+	// The cheap filter tag rejects nearly every random window before a MAC
+	// is computed.
+	if !s.signer.tagMatches(raw, scratch) {
+		return false
+	}
+
+	_, _, ok := s.signer.classify(raw)
+
+	return ok
 }

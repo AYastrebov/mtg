@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newTestSigner(t *testing.T, seed string) *tokenSigner {
+func newTestSigner(t testing.TB, seed string) *tokenSigner {
 	t.Helper()
 
 	signer, err := newTokenSigner(deriveTokenKey([]byte(seed)))

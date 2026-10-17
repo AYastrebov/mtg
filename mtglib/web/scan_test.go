@@ -3,18 +3,20 @@ package web
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func randomB64(t *testing.T) string {
+func randomB64(t testing.TB) string {
 	t.Helper()
 
 	raw := make([]byte, 32)
@@ -160,4 +162,129 @@ func percentEncodeAll(s string) string {
 	}
 
 	return string(out)
+}
+
+// scanRunReference is the straightforward scan: one decode per 43-char
+// window at every offset. scanRun must find exactly what it finds.
+func (s *secretScanner) scanRunReference(run string) bool {
+	for i := 0; i+tokenEncodedSize <= len(run); i++ {
+		raw, err := base64.RawURLEncoding.DecodeString(run[i : i+tokenEncodedSize])
+		if err != nil {
+			continue
+		}
+
+		if _, _, ok := s.signer.classify(raw); ok {
+			return true
+		}
+
+		for _, c := range s.capabilities {
+			if subtle.ConstantTimeCompare(raw, c) == 1 {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func randomTokenChars(t testing.TB, n int) string {
+	t.Helper()
+
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+	raw := make([]byte, n)
+	_, err := rand.Read(raw)
+	require.NoError(t, err)
+
+	for i := range raw {
+		raw[i] = alphabet[raw[i]&63]
+	}
+
+	return string(raw)
+}
+
+func TestScanRunMatchesReference(t *testing.T) {
+	t.Parallel()
+
+	signer := newTestSigner(t, "scan-equivalence")
+	tok, _, err := signer.issue(tokenBootstrap)
+	require.NoError(t, err)
+
+	capability := randomB64(t)
+	// A capability whose last char has non-zero padding bits: a lenient
+	// decode of this window yields the capability, as the reference finds.
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+	last := strings.IndexByte(alphabet, capability[42])
+	sloppy := capability[:42] + string(alphabet[last^1]) // flips a padding bit
+
+	scanner := newSecretScanner(signer, []string{capability})
+
+	for _, secret := range []string{tok, capability, sloppy} {
+		for prefix := range 9 {
+			for suffix := range 9 {
+				run := randomTokenChars(t, prefix) + secret + randomTokenChars(t, suffix)
+
+				want := scanner.scanRunReference(run)
+				assert.True(t, want, "prefix=%d suffix=%d", prefix, suffix)
+				assert.Equal(t, want, scanner.scanRun(run), "prefix=%d suffix=%d", prefix, suffix)
+
+				// Truncating the secret by one char at either end breaks it.
+				cut := run[:prefix] + secret[1:] + run[prefix+len(secret):]
+				assert.Equal(t, scanner.scanRunReference(cut), scanner.scanRun(cut))
+
+				cut = run[:prefix+len(secret)-1] + run[prefix+len(secret):]
+				assert.Equal(t, scanner.scanRunReference(cut), scanner.scanRun(cut))
+			}
+		}
+	}
+
+	for n := range 300 {
+		run := randomTokenChars(t, n)
+		assert.Equal(t, scanner.scanRunReference(run), scanner.scanRun(run), "len=%d", n)
+	}
+}
+
+func longTokenHeaderRequest(tb testing.TB, size int) *http.Request {
+	tb.Helper()
+
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("X-Foo", randomTokenChars(tb, size))
+
+	return r
+}
+
+func BenchmarkRequestCarriesSecret16KiB(b *testing.B) {
+	scanner := newSecretScanner(newTestSigner(b, "bench"), []string{randomB64(b)})
+	r := longTokenHeaderRequest(b, 16<<10)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		if scanner.requestCarriesSecret(r) {
+			b.Fatal("unexpected secret")
+		}
+	}
+}
+
+func TestScanner16KiBUnderMillisecond(t *testing.T) {
+	if testing.Short() || raceEnabled {
+		t.Skip("timing test: skipped with -short and under the race detector")
+	}
+
+	scanner := newSecretScanner(newTestSigner(t, "timing"), []string{randomB64(t)})
+	r := longTokenHeaderRequest(t, 16<<10)
+
+	// The best of several runs: a single run can be preempted.
+	best := time.Hour
+
+	for range 20 {
+		started := time.Now()
+		require.False(t, scanner.requestCarriesSecret(r))
+		best = min(best, time.Since(started))
+	}
+
+	t.Logf("16 KiB header scanned in %v", best)
+	assert.Less(t, best, time.Millisecond)
 }
