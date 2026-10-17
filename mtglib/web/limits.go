@@ -251,3 +251,8 @@ func (b *rateBucket) take(now time.Time) bool {
 
 	return true
 }
+
+// ValidateLimits checks that l is consistent.
+func ValidateLimits(l Limits) error {
+	return l.validate()
+}

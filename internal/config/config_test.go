@@ -1,11 +1,17 @@
 package config_test
 
 import (
+	"bytes"
+	"encoding/base64"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/9seconds/mtg/v2/internal/config"
+	"github.com/9seconds/mtg/v2/mtglib/web"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -113,6 +119,128 @@ func (suite *ConfigTestSuite) TestDomainFrontingNotSet() {
 	suite.NoError(err)
 	suite.NoError(conf.Validate())
 	suite.Equal("", conf.GetDomainFrontingHost())
+}
+
+const webTestBase = `
+secret = "7oe1GqLy6TBc38CV3jx7q09nb29nbGUuY29t"
+bind-to = "0.0.0.0:3128"
+
+[web]
+enabled = true
+bind-to = "127.0.0.1:8443"
+`
+
+func (suite *ConfigTestSuite) TestConfigWebMinimal() {
+	conf, err := config.Parse(suite.ReadConfig("web_minimal.toml"))
+	suite.NoError(err)
+	suite.NoError(conf.Validate())
+	suite.True(conf.Web.Enabled.Get(false))
+	suite.Equal("web.example.com", conf.Web.Hostname.Get(""))
+	suite.Equal("http://127.0.0.1:8080", conf.Web.PublicUpstream.String())
+	suite.Equal(web.DefaultLimits(), conf.GetWebLimits())
+	suite.Equal(web.DefaultTimeouts(), conf.GetWebTimeouts())
+	suite.Nil(conf.GetWebTrustedProxies())
+}
+
+func (suite *ConfigTestSuite) TestConfigWebOverrides() {
+	conf, err := config.Parse(suite.ReadConfig("web_limits.toml"))
+	suite.NoError(err)
+	suite.NoError(conf.Validate())
+
+	limits := conf.GetWebLimits()
+	defaults := web.DefaultLimits()
+	suite.Equal(10, limits.MaxSessions)
+	suite.Equal(1<<20, limits.CarrierBatchBytes)
+	suite.Equal(defaults.MaxStreams, limits.MaxStreams)
+
+	timeouts := conf.GetWebTimeouts()
+	suite.Equal(10*time.Second, timeouts.LongPoll)
+	suite.Equal(web.DefaultTimeouts().Shutdown, timeouts.Shutdown)
+
+	suite.Equal([]netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("::1/128"),
+	}, conf.GetWebTrustedProxies())
+}
+
+func (suite *ConfigTestSuite) TestConfigWebInvalid() {
+	dir := suite.T().TempDir()
+
+	testData := map[string]string{
+		"both public options": `
+hostname = "web.example.com"
+public-upstream = "http://127.0.0.1:8080"
+public-dir = "` + dir + `"`,
+		"no public option": `
+hostname = "web.example.com"`,
+		"uppercase hostname": `
+hostname = "Web.Example.com"
+public-upstream = "http://127.0.0.1:8080"`,
+		"no hostname": `
+public-upstream = "http://127.0.0.1:8080"`,
+		"https upstream": `
+hostname = "web.example.com"
+public-upstream = "https://127.0.0.1:8080"`,
+		"short token key": `
+hostname = "web.example.com"
+public-upstream = "http://127.0.0.1:8080"
+token-key = "` + base64.StdEncoding.EncodeToString(make([]byte, 16)) + `"`,
+		"small carrier batch": `
+hostname = "web.example.com"
+public-upstream = "http://127.0.0.1:8080"
+[web.limits]
+carrier-batch-bytes = "100kib"`,
+	}
+
+	for name, extra := range testData {
+		suite.T().Run(name, func(t *testing.T) {
+			conf, err := config.Parse([]byte(webTestBase + extra))
+			if err != nil {
+				return // rejected at parse time (type validation)
+			}
+
+			assert.Error(t, conf.Validate())
+		})
+	}
+}
+
+func (suite *ConfigTestSuite) TestConfigWebNoBindTo() {
+	conf, err := config.Parse([]byte(`
+secret = "7oe1GqLy6TBc38CV3jx7q09nb29nbGUuY29t"
+bind-to = "0.0.0.0:3128"
+
+[web]
+enabled = true
+hostname = "web.example.com"
+public-upstream = "http://127.0.0.1:8080"
+`))
+	suite.NoError(err)
+	suite.Error(conf.Validate())
+}
+
+func (suite *ConfigTestSuite) TestConfigWebDisabledSkipsValidation() {
+	conf, err := config.Parse([]byte(`
+secret = "7oe1GqLy6TBc38CV3jx7q09nb29nbGUuY29t"
+bind-to = "0.0.0.0:3128"
+
+[web]
+hostname = "Bad Host"
+`))
+	if err == nil {
+		suite.NoError(conf.Validate())
+	}
+}
+
+func (suite *ConfigTestSuite) TestConfigWebTokenKeyNotLogged() {
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xfb}, 32))
+	conf, err := config.Parse([]byte(webTestBase + `
+hostname = "web.example.com"
+public-upstream = "http://127.0.0.1:8080"
+token-key = "` + key + `"`))
+	suite.NoError(err)
+	suite.NoError(conf.Validate())
+	suite.Len(conf.Web.TokenKey.Get(nil), 32)
+	suite.NotContains(conf.String(), key)
 }
 
 func TestConfig(t *testing.T) {
