@@ -142,6 +142,10 @@ func newManager(profiles []Profile, limits Limits, timeouts Timeouts, signer *to
 		}
 
 		merged := limits.merge(p.Limits)
+		if err := merged.validateSessionBudget(); err != nil {
+			return nil, fmt.Errorf("profile %d: %w", p.Index, err)
+		}
+
 		m.profiles[p.Index] = &profileState{
 			profile:       &p,
 			limits:        merged,

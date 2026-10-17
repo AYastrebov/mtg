@@ -242,6 +242,11 @@ func applyTimeoutDefaults(t *Timeouts) error {
 		return fmt.Errorf("%w: timeout LongPoll is below 1ms", ErrOptions)
 	}
 
+	// Otherwise the janitor may expire a session while its poll is parked.
+	if t.LongPoll >= t.ReconnectGrace {
+		return fmt.Errorf("%w: timeout LongPoll must be below ReconnectGrace", ErrOptions)
+	}
+
 	return nil
 }
 

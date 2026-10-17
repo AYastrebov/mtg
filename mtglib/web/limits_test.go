@@ -2,9 +2,11 @@ package web
 
 import (
 	"math"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/9seconds/mtg/v2/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -65,16 +67,87 @@ func TestReserves(t *testing.T) {
 func TestMergeOnlyLowers(t *testing.T) {
 	g := DefaultLimits()
 
-	m := g.merge(ProfileLimits{MaxStreams: 10, MaxPendingPerSession: 1024})
+	m := g.merge(ProfileLimits{MaxStreams: 10, MaxPendingPerSession: 8 << 20})
 	assert.Equal(t, 10, m.MaxStreams)
-	assert.Equal(t, int64(1024), m.MaxPendingPerSession)
+	assert.Equal(t, int64(8<<20), m.MaxPendingPerSession)
 	assert.Equal(t, g.MaxSessions, m.MaxSessions)
+	assert.NoError(t, m.validateSessionBudget())
+
+	// merge itself does not judge: a too low override is caught by
+	// validateSessionBudget, which newManager runs on every profile.
+	m = g.merge(ProfileLimits{MaxPendingPerSession: 1024})
+	assert.Equal(t, int64(1024), m.MaxPendingPerSession)
+	assert.ErrorIs(t, m.validateSessionBudget(), ErrLimits)
 
 	m = g.merge(ProfileLimits{MaxStreams: 99999, MaxPendingPerSession: 1 << 40})
 	assert.Equal(t, g.MaxStreams, m.MaxStreams)
 	assert.Equal(t, g.MaxPendingPerSession, m.MaxPendingPerSession)
 
 	assert.Equal(t, g, g.merge(ProfileLimits{}))
+}
+
+func TestLimitsPendingPerSessionMinimum(t *testing.T) {
+	l := DefaultLimits()
+	minimum := l.controlReserveBytes() + l.uplinkReserveBytes() + (1 << 20)
+	assert.Equal(t, minimum, l.minPendingPerSession())
+
+	l.MaxPendingPerSession = minimum - 1
+	err := l.validate()
+	require.ErrorIs(t, err, ErrLimits)
+	assert.Contains(t, err.Error(), strconv.FormatInt(minimum, 10))
+
+	l.MaxPendingPerSession = minimum
+	assert.NoError(t, l.validate())
+}
+
+func TestNewManagerRejectsLowProfilePending(t *testing.T) {
+	g := DefaultLimits()
+	low := Profile{Index: 3, Secret: handlerSecret(7)}
+
+	// Lowering MaxStreamsPerSession lowers the control reserve, and with
+	// it the minimum.
+	low.Limits = ProfileLimits{MaxStreamsPerSession: 10}
+	minimum := g.merge(low.Limits).minPendingPerSession()
+
+	signer := newTestSigner(t, "limits")
+	build := func(pending int64) error {
+		p := low
+		p.Limits.MaxPendingPerSession = pending
+		_, err := newManager([]Profile{p}, g, DefaultTimeouts(), signer,
+			(&fakeServe{}).serve, logger.NewNoopLogger(), time.Now)
+
+		return err
+	}
+
+	err := build(minimum - 1)
+	require.ErrorIs(t, err, ErrLimits)
+	assert.Contains(t, err.Error(), "profile 3")
+
+	require.NoError(t, build(minimum))
+
+	_, err = NewHandler(Options{
+		Hostname: testHostname,
+		Profiles: []Profile{{Index: 0, Secret: low.Secret, Limits: ProfileLimits{MaxPendingPerSession: 1024}}},
+		Serve:    (&fakeServe{}).serve,
+		Public:   &recordingPublic{},
+	})
+	require.ErrorIs(t, err, ErrOptions)
+	assert.ErrorIs(t, err, ErrLimits)
+}
+
+func TestTimeoutsLongPollBelowReconnectGrace(t *testing.T) {
+	to := Timeouts{LongPoll: time.Minute, ReconnectGrace: time.Minute}
+	require.ErrorIs(t, applyTimeoutDefaults(&to), ErrOptions)
+
+	to = Timeouts{LongPoll: 3 * time.Minute} // default grace is 2m
+	require.ErrorIs(t, applyTimeoutDefaults(&to), ErrOptions)
+
+	to = Timeouts{LongPoll: time.Minute - time.Millisecond, ReconnectGrace: time.Minute}
+	require.NoError(t, applyTimeoutDefaults(&to))
+
+	to = Timeouts{}
+	require.NoError(t, applyTimeoutDefaults(&to))
+	assert.Equal(t, DefaultTimeouts(), to)
 }
 
 func TestRateBucket(t *testing.T) {

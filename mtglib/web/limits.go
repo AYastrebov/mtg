@@ -21,6 +21,11 @@ const (
 	// multiplies it by 3 in int.
 	maxStreamsPerSessionLimit = 1 << 20
 	maxBytesLimit             = 1 << 50
+
+	// minDownlinkBytes is the smallest downlink share of a per-session
+	// budget: what is left of MaxPendingPerSession after the control and
+	// uplink reserves.
+	minDownlinkBytes = 1 << 20
 )
 
 // ErrLimits is returned when Limits are inconsistent.
@@ -190,6 +195,25 @@ func (l Limits) validate() error {
 
 	if int64(l.MaxSessions) > (int64(l.MaxPendingItemsGlobal)-1)/int64(l.controlReserveItems()) {
 		return fmt.Errorf("%w: control reserve of MaxSessions exhausts MaxPendingItemsGlobal", ErrLimits)
+	}
+
+	return l.validateSessionBudget()
+}
+
+// minPendingPerSession is the smallest MaxPendingPerSession that leaves the
+// downlink some room beside the control and uplink reserves. With less, no
+// downlink data can ever be queued and every session stalls.
+func (l Limits) minPendingPerSession() int64 {
+	return l.controlReserveBytes() + l.uplinkReserveBytes() + minDownlinkBytes
+}
+
+// validateSessionBudget checks the per-session byte budget. It must hold for
+// the global limits and for every profile's merged limits.
+func (l Limits) validateSessionBudget() error {
+	if minimum := l.minPendingPerSession(); l.MaxPendingPerSession < minimum {
+		return fmt.Errorf("%w: MaxPendingPerSession %d is below the minimum %d "+
+			"(control and uplink reserves plus 1 MiB of downlink)",
+			ErrLimits, l.MaxPendingPerSession, minimum)
 	}
 
 	return nil
