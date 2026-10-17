@@ -863,14 +863,24 @@ func TestPipeZeroReadWaits(t *testing.T) {
 func TestSessionDownlinkHeadroom(t *testing.T) {
 	h := newTestSession(t, nil)
 
-	_, err := uploadOnce(h.s, 1, openFrame(7))
-	require.NoError(t, err)
-
 	h.s.mu.Lock()
 	full := h.s.downlinkHeadroomLocked()
-	h.s.pendingBytes[pendingDownlink] += full
+	require.Positive(t, full)
+
+	// The item cap alone closes the headroom.
+	h.s.pendingItems[pendingDownlink] = h.s.downlinkItemsCap()
+	assert.Zero(t, h.s.downlinkHeadroomLocked())
+	h.s.pendingItems[pendingDownlink] = 0
+
+	// So does the byte cap. It is exhausted before the stream exists, so
+	// its downlink pump deterministically starts without headroom and
+	// parks before reading anything.
+	require.True(t, h.s.chargeLocked(pendingDownlink, full, 0))
 	assert.Zero(t, h.s.downlinkHeadroomLocked())
 	h.s.mu.Unlock()
+
+	_, err := uploadOnce(h.s, 1, openFrame(7))
+	require.NoError(t, err)
 
 	conn := h.serve.conn(t, 0)
 	written := make(chan error, 1)
@@ -894,6 +904,14 @@ func TestSessionDownlinkHeadroom(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("write did not resume after release")
 	}
+
+	// The released headroom carries the data.
+	require.Eventually(t, func() bool {
+		h.s.mu.Lock()
+		defer h.s.mu.Unlock()
+
+		return h.s.pendingItems[pendingDownlink] == 1
+	}, 2*time.Second, time.Millisecond)
 }
 
 func TestSessionGlobalDownlinkRefusalRetries(t *testing.T) {
