@@ -27,6 +27,16 @@ func (suite *ConfigTestSuite) ReadConfig(filename string) []byte {
 	return data
 }
 
+func (suite *ConfigTestSuite) TestExampleConfigParses() {
+	data, err := os.ReadFile("../../example.config.toml")
+	suite.Require().NoError(err)
+
+	conf, err := config.Parse(data)
+	suite.Require().NoError(err)
+	suite.NoError(conf.Validate())
+	suite.False(conf.Web.Enabled.Get(false))
+}
+
 func (suite *ConfigTestSuite) TestParseEmpty() {
 	_, err := config.Parse([]byte{})
 	suite.Error(err)
