@@ -3,6 +3,8 @@ package web
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -311,4 +313,96 @@ func TestHandleDownClientGone(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec2.Code)
 	assert.Equal(t, rec.Body.Bytes(), rec2.Body.Bytes())
 	assert.Equal(t, "1", rec2.Header().Get("X-Down-Cursor"))
+}
+
+// deadlineRecorder is a ResponseRecorder that http.ResponseController can
+// set read deadlines on; it records them, and fails them with err.
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+
+	err       error
+	deadlines []time.Time
+}
+
+func newDeadlineRecorder(err error) *deadlineRecorder {
+	return &deadlineRecorder{ResponseRecorder: httptest.NewRecorder(), err: err}
+}
+
+func (d *deadlineRecorder) SetReadDeadline(t time.Time) error {
+	d.deadlines = append(d.deadlines, t)
+
+	return d.err
+}
+
+// assertBodyDeadline checks that a body read was bracketed by an armed
+// bodyReadTimeout deadline and its reset.
+func assertBodyDeadline(t *testing.T, rec *deadlineRecorder, armedAt time.Time) {
+	t.Helper()
+
+	require.Len(t, rec.deadlines, 2)
+	assert.WithinDuration(t, armedAt.Add(bodyReadTimeout), rec.deadlines[0], time.Second)
+	assert.True(t, rec.deadlines[1].IsZero())
+}
+
+func TestBodyReadTimeout(t *testing.T) {
+	assert.Equal(t, 30*time.Second, bodyReadTimeout)
+}
+
+func TestHandleUpSetsBodyDeadline(t *testing.T) {
+	c, h := newTestCarrier(t, nil)
+
+	rec := newDeadlineRecorder(nil)
+	started := time.Now()
+	c.handleUp(rec, upRequest("1", octetStream, batch(openFrame(7), dataFrame(7, []byte("abc")))), h.s)
+
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Equal(t, "1", rec.Header().Get("X-Up-Ack"))
+	assertBodyDeadline(t, rec, started)
+
+	conn := h.serve.conn(t, 0)
+	assert.Equal(t, "abc", string(readN(t, conn, 3)))
+}
+
+func TestHandleUpDeadlineFailureIs404(t *testing.T) {
+	c, h := newTestCarrier(t, nil)
+	c.onBytes = func(_, _ uint64) { t.Error("onBytes must not be called") }
+
+	rec := newDeadlineRecorder(errors.New("connection is gone"))
+	c.handleUp(rec, upRequest("1", octetStream, batch(openFrame(7))), h.s)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Len(t, rec.deadlines, 1)
+	assert.Zero(t, h.serve.count())
+
+	// The batch was not applied: the same sequence is still the next one.
+	c.onBytes = nil
+	rec2 := httptest.NewRecorder()
+	c.handleUp(rec2, upRequest("1", octetStream, batch(openFrame(7))), h.s)
+	assert.Equal(t, http.StatusNoContent, rec2.Code)
+}
+
+func TestHandleDownChunkedBodySetsDeadline(t *testing.T) {
+	c, h := newTestCarrier(t, nil)
+
+	// A body of unknown length is read (one byte) under the deadline.
+	r := downRequest("0", []byte{})
+	r.ContentLength = -1
+	r.Body = io.NopCloser(bytes.NewReader(nil))
+
+	rec := newDeadlineRecorder(nil)
+	started := time.Now()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	c.handleDown(rec, r.WithContext(ctx), h.s)
+	assertBodyDeadline(t, rec, started)
+
+	// No deadline for an empty body: there is nothing to read.
+	rec = newDeadlineRecorder(errors.New("must not be called"))
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+
+	c.handleDown(rec, downRequest("0", nil).WithContext(ctx2), h.s)
+	assert.Empty(t, rec.deadlines)
 }

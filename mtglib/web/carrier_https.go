@@ -56,8 +56,17 @@ func (c *httpsCarrier) handleUp(w http.ResponseWriter, r *http.Request, s *sessi
 		return
 	}
 
+	if !armBodyDeadline(w) {
+		localNotFound(w)
+
+		return
+	}
+
 	// MaxBytesError also lands here.
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, int64(c.limits.MaxBodyBytes)))
+
+	disarmBodyDeadline(w)
+
 	if err != nil || len(body) == 0 {
 		localNotFound(w)
 
@@ -90,7 +99,7 @@ func (c *httpsCarrier) handleUp(w http.ResponseWriter, r *http.Request, s *sessi
 }
 
 func (c *httpsCarrier) handleDown(w http.ResponseWriter, r *http.Request, s *session) {
-	if len(r.Header.Values("Content-Type")) != 0 || r.ContentLength > 0 || !emptyBody(r.Body) {
+	if len(r.Header.Values("Content-Type")) != 0 || r.ContentLength > 0 || !emptyBodyBounded(w, r) {
 		localNotFound(w)
 
 		return

@@ -869,3 +869,38 @@ func (l *recordingLogger) Warning(msg string)                 { l.add(msg, nil) 
 func (l *recordingLogger) WarningError(msg string, err error) { l.add(msg, err) }
 func (l *recordingLogger) Debug(msg string)                   { l.add(msg, nil) }
 func (l *recordingLogger) DebugError(msg string, err error)   { l.add(msg, err) }
+
+func TestSessionCreateSetsBodyDeadline(t *testing.T) {
+	t.Parallel()
+
+	hh := newHandlerHarness(t, nil)
+
+	build := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/session", bytes.NewReader(helloBody()))
+		r.RemoteAddr = "127.0.0.1:40000"
+		r.Host = testHostname
+		r.Header.Set("X-Forwarded-For", testXFF)
+		r.Header.Set("Authorization", "Bearer "+hh.bridge(t, 0))
+		r.Header.Set("Content-Type", octetStream)
+
+		return r
+	}
+
+	rec := newDeadlineRecorder(nil)
+	started := time.Now()
+	hh.h.ServeHTTP(rec, build())
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Len(t, rec.Header().Get("X-Session-Token"), tokenEncodedSize)
+	assertBodyDeadline(t, rec, started)
+
+	// A connection that refuses the deadline gets a local 404 and no
+	// session.
+	live := hh.h.Stats().SessionsLive
+	rec = newDeadlineRecorder(errors.New("connection is gone"))
+	hh.h.ServeHTTP(rec, build())
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Empty(t, rec.Header().Get("X-Session-Token"))
+	assert.Equal(t, live, hh.h.Stats().SessionsLive)
+}

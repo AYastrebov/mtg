@@ -25,6 +25,11 @@ const (
 	// cleanupInterval is how often bootstraps and idle sessions expire.
 	cleanupInterval = 30 * time.Second
 
+	// bodyReadTimeout bounds reading the body of an authenticated request:
+	// the protocol keeps bodies under the carrier read deadline, so a
+	// secret holder cannot trickle a body and hold a request forever.
+	bodyReadTimeout = 30 * time.Second
+
 	bridgeQueryPrefix = "bridge="
 	bearerPrefix      = "Bearer "
 )
@@ -384,7 +389,16 @@ func (h *Handler) serveSessionCreate(w http.ResponseWriter, r *http.Request, ip 
 		return
 	}
 
+	if !armBodyDeadline(w) {
+		localNotFound(w)
+
+		return
+	}
+
 	hello, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxHelloBytes))
+
+	disarmBodyDeadline(w)
+
 	if err != nil || ParseHello(hello) != nil {
 		localNotFound(w)
 
@@ -432,7 +446,7 @@ func (h *Handler) serveSessionCreate(w http.ResponseWriter, r *http.Request, ip 
 
 func (h *Handler) serveSessionDelete(w http.ResponseWriter, r *http.Request) {
 	token, ok := bearerToken(r)
-	if !ok || len(r.Header.Values("Content-Type")) != 0 || r.ContentLength > 0 || !emptyBody(r.Body) {
+	if !ok || len(r.Header.Values("Content-Type")) != 0 || r.ContentLength > 0 || !emptyBodyBounded(w, r) {
 		localNotFound(w)
 
 		return
@@ -476,6 +490,38 @@ func (h *Handler) serveCarrier(w http.ResponseWriter, r *http.Request, kind rout
 	if isSessionClosed(s) {
 		h.manager.deleteSession(token)
 	}
+}
+
+// armBodyDeadline sets the read deadline for the request body. A writer
+// that cannot set deadlines (http.ErrNotSupported, e.g. some test servers)
+// is accepted; any other error means the request must be refused.
+func armBodyDeadline(w http.ResponseWriter) bool {
+	err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
+
+	return err == nil || errors.Is(err, http.ErrNotSupported)
+}
+
+// disarmBodyDeadline clears the body read deadline once the body is read.
+// It must not outlive the body: net/http keeps reading the connection in
+// the background to notice a client that went away, and a deadline firing
+// there would cancel the request context (e.g. of a long poll).
+func disarmBodyDeadline(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+}
+
+// emptyBodyBounded is emptyBody under the body read deadline.
+func emptyBodyBounded(w http.ResponseWriter, r *http.Request) bool {
+	if r.Body == nil || r.Body == http.NoBody {
+		return true
+	}
+
+	if !armBodyDeadline(w) {
+		return false
+	}
+
+	defer disarmBodyDeadline(w)
+
+	return emptyBody(r.Body)
 }
 
 // bearerToken returns the token of the single Authorization header.
