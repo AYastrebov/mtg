@@ -274,6 +274,19 @@ func TestServeWebConnRejects(t *testing.T) {
 		assert.ErrorIs(t, proxy.ServeWebConn(proxySide, -1), mtglib.ErrSecretIndex)
 	})
 
+	t.Run("remote addr", func(t *testing.T) {
+		proxy, _, _ := newWebProxy(t, webProxyOpts{})
+
+		a, b := net.Pipe()
+		t.Cleanup(func() { a.Close(); b.Close() }) //nolint: errcheck
+
+		// net.Pipe addresses are not *net.TCPAddr.
+		assert.ErrorIs(t, proxy.ServeWebConn(essentials.WrapNetConn(a), 0), mtglib.ErrRemoteAddr)
+
+		_, err := b.Read(make([]byte, 1))
+		assert.Error(t, err, "the connection is closed")
+	})
+
 	t.Run("blocklist", func(t *testing.T) {
 		proxy, rec, _ := newWebProxy(t, webProxyOpts{blocklist: ipSet{webClientIP}})
 		proxySide, clientSide := newWebPipe(t)

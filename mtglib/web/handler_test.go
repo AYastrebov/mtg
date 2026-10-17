@@ -579,6 +579,22 @@ func TestAuthenticRequestRequiresClientIP(t *testing.T) {
 	assert.Equal(t, 0, hh.public.count())
 }
 
+func TestEmptyTrustedProxiesMeansLoopback(t *testing.T) {
+	t.Parallel()
+
+	hh := newHandlerHarness(t, func(o *Options) {
+		o.TrustedProxies = []netip.Prefix{}
+	})
+
+	assert.Equal(t, []netip.Prefix{
+		netip.MustParsePrefix("127.0.0.0/8"),
+		netip.MustParsePrefix("::1/128"),
+	}, hh.h.trusted)
+
+	// The test server is on loopback: the bridge is served.
+	hh.bridge(t, 0)
+}
+
 func TestSessionCreateRejectsBadHello(t *testing.T) {
 	t.Parallel()
 

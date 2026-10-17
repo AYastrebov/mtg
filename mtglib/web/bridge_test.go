@@ -108,6 +108,8 @@ func TestWriteBridgeHeaders(t *testing.T) {
 		"default-src 'none'",
 		"script-src 'nonce-" + p.Nonce + "'",
 		"connect-src 'self' wss://proxy.example.com",
+		"base-uri 'none'",
+		"form-action 'none'",
 		"frame-ancestors http://127.0.0.1:*",
 		"sandbox allow-same-origin allow-scripts",
 	}, "; ")
@@ -119,6 +121,23 @@ func TestWriteBridgeHeaders(t *testing.T) {
 	assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
 	assert.Equal(t, "off", rec.Header().Get("X-DNS-Prefetch-Control"))
 	assert.Equal(t, permissionsPolicy, rec.Header().Get("Permissions-Policy"))
+
+	policy := strings.Split(rec.Header().Get("Permissions-Policy"), ", ")
+	for _, f := range []string{
+		"camera=()", "microphone=()", "geolocation=()", "payment=()", "usb=()", "midi=()",
+		"magnetometer=()", "gyroscope=()", "accelerometer=()", "display-capture=()",
+		"fullscreen=()", "picture-in-picture=()", "publickey-credentials-get=()",
+		"screen-wake-lock=()", "xr-spatial-tracking=()",
+	} {
+		assert.Contains(t, policy, f)
+	}
+
+	seen := map[string]bool{}
+	for _, f := range policy {
+		assert.Regexp(t, `^[a-z-]+=\(\)$`, f)
+		assert.False(t, seen[f], "duplicate %s", f)
+		seen[f] = true
+	}
 	assert.Empty(t, rec.Header().Values("X-Frame-Options"))
 	assert.Equal(t, strconv.Itoa(len(p.Body)), rec.Header().Get("Content-Length"))
 	assert.Equal(t, p.Body, rec.Body.Bytes())

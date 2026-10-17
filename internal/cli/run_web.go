@@ -92,6 +92,9 @@ func serveWebListener(ctx context.Context,
 		ReadHeaderTimeout: webReadHeaderTimeout,
 		IdleTimeout:       webIdleTimeout,
 		MaxHeaderBytes:    webMaxHeaderBytes,
+		// OPTIONS * reaches the handler, and so the public site, instead of
+		// a built-in answer that only a Go server gives.
+		DisableGeneralOptionsHandler: true,
 	}
 
 	go func() {

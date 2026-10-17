@@ -13,11 +13,38 @@ import (
 
 const bridgeNonceBytes = 18
 
-const permissionsPolicy = "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), " +
-	"clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), " +
-	"gyroscope=(), hid=(), idle-detection=(), magnetometer=(), microphone=(), midi=(), payment=(), " +
-	"picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), " +
-	"screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()"
+// bridgeDisabledFeatures are the browser features the bridge page turns off.
+// The page only runs fetch and postMessage, so it needs none of them: no
+// device or sensor access, no media capture or playback, no credentials, no
+// clipboard and no display or window control.
+var bridgeDisabledFeatures = []string{
+	// capture and media
+	"camera", "microphone", "display-capture", "speaker-selection",
+	"autoplay", "encrypted-media", "picture-in-picture", "fullscreen",
+	// location and sensors
+	"geolocation", "accelerometer", "gyroscope", "magnetometer",
+	"ambient-light-sensor", "xr-spatial-tracking",
+	// devices
+	"usb", "serial", "hid", "bluetooth", "midi", "gamepad",
+	// payments and credentials
+	"payment", "publickey-credentials-get", "publickey-credentials-create",
+	"otp-credentials", "identity-credentials-get",
+	// system and window
+	"screen-wake-lock", "idle-detection", "window-management", "local-fonts",
+	"clipboard-read", "clipboard-write", "web-share", "keyboard-map",
+	// tracking and storage
+	"browsing-topics", "attribution-reporting", "storage-access",
+}
+
+// permissionsPolicy disables every feature of bridgeDisabledFeatures.
+var permissionsPolicy = func() string {
+	parts := make([]string, len(bridgeDisabledFeatures))
+	for i, f := range bridgeDisabledFeatures {
+		parts[i] = f + "=()"
+	}
+
+	return strings.Join(parts, ", ")
+}()
 
 var (
 	errBridge = errors.New("cannot render bridge page")
@@ -96,6 +123,8 @@ func renderBridgeTemplate(tmpl, hostname, bootstrap string, batchBytes, longPoll
 		"default-src 'none'",
 		"script-src 'nonce-" + nonce + "'",
 		"connect-src 'self' wss://" + hostname,
+		"base-uri 'none'",
+		"form-action 'none'",
 		"frame-ancestors http://127.0.0.1:*",
 		"sandbox allow-same-origin allow-scripts",
 	}, "; ")

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"io"
@@ -257,6 +258,37 @@ shutdown = "4s"
 	case <-time.After(2 * time.Second):
 		t.Fatal("parked poll did not return")
 	}
+}
+
+func TestServeWebOptionsAsteriskReachesHandler(t *testing.T) {
+	conf := webTestEnabledConfig(t)
+	log := logger.NewNoopLogger()
+
+	handler, err := makeWebHandler(conf, webTestProxy(t, conf), log)
+	require.NoError(t, err)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	shutdown := serveWebListener(t.Context(), conf, handler, listener, log)
+	t.Cleanup(shutdown)
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	require.NoError(t, err)
+
+	defer conn.Close() //nolint: errcheck
+
+	_, err = io.WriteString(conn, "OPTIONS * HTTP/1.1\r\nHost: web.example.com\r\nConnection: close\r\n\r\n")
+	require.NoError(t, err)
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+
+	defer resp.Body.Close() //nolint: errcheck
+
+	// net/http's general OPTIONS handler would answer 200; the public dir
+	// answers 405 to anything but GET and HEAD.
+	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
 }
 
 func TestServeWebDisabled(t *testing.T) {

@@ -31,6 +31,10 @@ var (
 
 	// ErrProxyClosed is returned by ServeWebConn if the proxy is shut down.
 	ErrProxyClosed = errors.New("proxy is closed")
+
+	// ErrRemoteAddr is returned by ServeWebConn if conn.RemoteAddr() is not
+	// a *net.TCPAddr.
+	ErrRemoteAddr = errors.New("remote address is not a TCP address")
 )
 
 // obfuscatedFrameSize is the length of the obfuscated2 client handshake.
@@ -43,8 +47,9 @@ const obfuscatedFrameSize = 64
 // secretIdx is the index into the configured secrets that keys the obfuscated2
 // handshake of this connection.
 //
-// conn.RemoteAddr() must be a *net.TCPAddr: the client IP is taken from it
-// for the access lists and events.
+// conn.RemoteAddr() must be a non-nil *net.TCPAddr: the client IP is taken
+// from it for the access lists and events. Otherwise ErrRemoteAddr is
+// returned.
 //
 // On any returned error the connection has been closed.
 func (p *Proxy) ServeWebConn(conn essentials.Conn, secretIdx int) error {
@@ -58,7 +63,13 @@ func (p *Proxy) ServeWebConn(conn essentials.Conn, secretIdx int) error {
 		return ErrProxyClosed
 	}
 
-	ipAddr := conn.RemoteAddr().(*net.TCPAddr).IP //nolint: forcetypeassert
+	tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr)
+	if !ok || tcpAddr == nil {
+		conn.Close() //nolint: errcheck
+		return ErrRemoteAddr
+	}
+
+	ipAddr := tcpAddr.IP
 	logger := p.logger.BindStr("ip", ipAddr.String())
 
 	if !p.allowlist.Contains(ipAddr) {

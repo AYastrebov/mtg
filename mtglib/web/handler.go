@@ -48,11 +48,15 @@ type Options struct {
 	Serve func(conn essentials.Conn, secretIdx int) error
 	// Public answers every request that carries no authentic secret.
 	Public http.Handler
-	// TrustedProxies are the peers allowed to set X-Forwarded-For. nil means
-	// loopback only (127.0.0.0/8 and ::1/128).
+	// TrustedProxies are the peers allowed to set X-Forwarded-For. nil or
+	// empty means loopback only (127.0.0.0/8 and ::1/128). An explicit
+	// "trust nothing" cannot be expressed, and is not needed: the handler
+	// always runs behind a reverse proxy, which must be trusted.
 	TrustedProxies []netip.Prefix
 	// TokenKey signs bootstrap and session tokens: nil derives it from the
 	// first profile's secret, otherwise it must be exactly 32 bytes.
+	// Multi-tenant embedders should set an explicit key: with the default,
+	// whoever knows Profiles[0]'s secret can derive the signing key.
 	TokenKey []byte
 	// Limits; the zero value means DefaultLimits().
 	Limits Limits
@@ -196,7 +200,7 @@ func validateOptions(opts *Options) error {
 		return fmt.Errorf("%w: token key must be %d bytes", ErrOptions, tokenKeySize)
 	}
 
-	if opts.TrustedProxies == nil {
+	if len(opts.TrustedProxies) == 0 {
 		opts.TrustedProxies = []netip.Prefix{
 			netip.MustParsePrefix("127.0.0.0/8"),
 			netip.MustParsePrefix("::1/128"),
