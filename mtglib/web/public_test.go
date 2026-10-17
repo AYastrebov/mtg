@@ -51,13 +51,17 @@ func TestPublicUpstreamForwardedHeaders(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	send := func(xff string) {
+	send := func(xff string, hdr ...string) {
 		req, err := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
 		require.NoError(t, err)
 
 		req.Host = "site.example.org"
 		if xff != "" {
 			req.Header.Set("X-Forwarded-For", xff)
+		}
+
+		for i := 0; i+1 < len(hdr); i += 2 {
+			req.Header.Set(hdr[i], hdr[i+1])
 		}
 
 		resp, err := srv.Client().Do(req)
@@ -75,6 +79,12 @@ func TestPublicUpstreamForwardedHeaders(t *testing.T) {
 	assert.Equal(t, []string{"127.0.0.1"}, got.Values("X-Forwarded-For"))
 	assert.Equal(t, "site.example.org", got.Get("X-Forwarded-Host"))
 	assert.Equal(t, "http", got.Get("X-Forwarded-Proto"))
+
+	// the TLS-terminating front proxy's values are kept
+	send("203.0.113.7", "X-Forwarded-Proto", "https", "X-Forwarded-Host", "front.example.org")
+	assert.Equal(t, []string{"https"}, got.Values("X-Forwarded-Proto"))
+	assert.Equal(t, []string{"front.example.org"}, got.Values("X-Forwarded-Host"))
+	assert.Equal(t, []string{"203.0.113.7, 127.0.0.1"}, got.Values("X-Forwarded-For"))
 }
 
 func TestPublicUpstreamBadGateway(t *testing.T) {
