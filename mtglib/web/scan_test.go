@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -268,23 +267,26 @@ func BenchmarkRequestCarriesSecret16KiB(b *testing.B) {
 	}
 }
 
-func TestScanner16KiBUnderMillisecond(t *testing.T) {
-	if testing.Short() || raceEnabled {
-		t.Skip("timing test: skipped with -short and under the race detector")
-	}
+// TestScannerScansRunWithFewAllocations pins the per-alignment scan by its
+// allocation count, which is deterministic, instead of by wall time, which
+// depends on the machine: the per-offset reference allocates once per
+// window, the per-alignment scan once per alignment.
+func TestScannerScansRunWithFewAllocations(t *testing.T) {
+	scanner := newSecretScanner(newTestSigner(t, "allocs"), []string{randomB64(t)})
+	run := randomTokenChars(t, 16<<10)
 
-	scanner := newSecretScanner(newTestSigner(t, "timing"), []string{randomB64(t)})
-	r := longTokenHeaderRequest(t, 16<<10)
+	fast := testing.AllocsPerRun(10, func() {
+		if scanner.scanRun(run) {
+			t.Error("unexpected secret")
+		}
+	})
+	reference := testing.AllocsPerRun(10, func() {
+		if scanner.scanRunReference(run) {
+			t.Error("unexpected secret")
+		}
+	})
 
-	// The best of several runs: a single run can be preempted.
-	best := time.Hour
-
-	for range 20 {
-		started := time.Now()
-		require.False(t, scanner.requestCarriesSecret(r))
-		best = min(best, time.Since(started))
-	}
-
-	t.Logf("16 KiB header scanned in %v", best)
-	assert.Less(t, best, time.Millisecond)
+	t.Logf("16 KiB run: per-alignment %.0f allocs, per-offset reference %.0f allocs", fast, reference)
+	assert.LessOrEqual(t, fast, 16.0)
+	assert.Greater(t, reference, fast*64)
 }
