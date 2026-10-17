@@ -411,6 +411,12 @@ func (m *manager) cleanup(now time.Time) {
 }
 
 func (m *manager) closeAll() {
+	m.closeAllSessions()
+}
+
+// closeAllSessions closes every live session and returns them, so that the
+// caller can wait for their pumps.
+func (m *manager) closeAllSessions() []*session {
 	m.mu.Lock()
 
 	now := m.now()
@@ -426,6 +432,8 @@ func (m *manager) closeAll() {
 	for _, s := range toClose {
 		s.close()
 	}
+
+	return toClose
 }
 
 func (m *manager) stats() Stats {
