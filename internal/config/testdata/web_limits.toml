@@ -10,6 +10,7 @@ trusted-proxies = ["10.0.0.0/8", "::1"]
 
 [web.limits]
 max-sessions = 10
+max-pending-items-global = 300000
 carrier-batch-bytes = "1mib"
 
 [web.timeouts]

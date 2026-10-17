@@ -126,9 +126,9 @@ type Config struct {
 			MaxBodyBytes         TypeBytes `json:"maxBodyBytes"`
 			MaxFramePayload      TypeBytes `json:"maxFramePayload"`
 
-			MaxPendingItemsPerSession TypeConcurrency `json:"maxPendingItemsPerSession"`
-			MaxPendingItemsGlobal     TypeConcurrency `json:"maxPendingItemsGlobal"`
-			MaxClosedStreamIDs        TypeConcurrency `json:"maxClosedStreamIds"`
+			MaxPendingItemsPerSession TypeCount `json:"maxPendingItemsPerSession"`
+			MaxPendingItemsGlobal     TypeCount `json:"maxPendingItemsGlobal"`
+			MaxClosedStreamIDs        TypeCount `json:"maxClosedStreamIds"`
 		} `json:"limits"`
 		Timeouts struct {
 			LongPoll          TypeDuration `json:"longPoll"`
@@ -180,6 +180,9 @@ func (c *Config) GetWebLimits() web.Limits {
 	count := func(dst *int, v TypeConcurrency) {
 		*dst = int(v.Get(uint(*dst)))
 	}
+	bigCount := func(dst *int, v TypeCount) {
+		*dst = int(v.Get(uint(*dst)))
+	}
 	size := func(dst *int, v TypeBytes) {
 		*dst = int(v.Get(uint(*dst)))
 	}
@@ -205,13 +208,13 @@ func (c *Config) GetWebLimits() web.Limits {
 	size64(&l.MaxPendingPerSession, cl.MaxPendingPerSession)
 	size64(&l.MaxPendingGlobal, cl.MaxPendingGlobal)
 
-	count(&l.MaxPendingItemsPerSession, cl.MaxPendingItemsPerSession)
-	count(&l.MaxPendingItemsGlobal, cl.MaxPendingItemsGlobal)
+	bigCount(&l.MaxPendingItemsPerSession, cl.MaxPendingItemsPerSession)
+	bigCount(&l.MaxPendingItemsGlobal, cl.MaxPendingItemsGlobal)
 
 	size(&l.CarrierBatchBytes, cl.CarrierBatchBytes)
 	size(&l.MaxBodyBytes, cl.MaxBodyBytes)
 	size(&l.MaxFramePayload, cl.MaxFramePayload)
-	count(&l.MaxClosedStreamIDs, cl.MaxClosedStreamIDs)
+	bigCount(&l.MaxClosedStreamIDs, cl.MaxClosedStreamIDs)
 
 	return l
 }

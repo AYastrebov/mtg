@@ -151,6 +151,7 @@ func (suite *ConfigTestSuite) TestConfigWebOverrides() {
 	defaults := web.DefaultLimits()
 	suite.Equal(10, limits.MaxSessions)
 	suite.Equal(1<<20, limits.CarrierBatchBytes)
+	suite.Equal(300000, limits.MaxPendingItemsGlobal)
 	suite.Equal(defaults.MaxStreams, limits.MaxStreams)
 
 	timeouts := conf.GetWebTimeouts()
