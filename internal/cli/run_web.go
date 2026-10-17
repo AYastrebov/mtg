@@ -62,7 +62,8 @@ func makeWebHandler(conf *config.Config, proxy *mtglib.Proxy, logger mtglib.Logg
 }
 
 // serveWeb starts serving the WEB proxy on its own listener. It returns a nil
-// shutdown if handler is nil. The returned shutdown is idempotent.
+// shutdown if handler is nil. The returned shutdown is idempotent: it shuts
+// the handler down first (releasing parked long polls), then the server.
 func serveWeb(ctx context.Context,
 	conf *config.Config,
 	handler *web.Handler,
@@ -101,6 +102,11 @@ func serveWebListener(ctx context.Context,
 
 	once := &sync.Once{}
 
+	// The handler is shut down first: it closes every session, which
+	// releases parked /down long polls, and answers authenticated requests
+	// with 404 from then on. Only then does server.Shutdown wait for active
+	// requests, which no longer include a long poll held for up to
+	// web.timeouts.long-poll. Both share one web.timeouts.shutdown budget.
 	return func() {
 		once.Do(func() {
 			// The root context is already done when shutdown is called, so
@@ -109,12 +115,12 @@ func serveWebListener(ctx context.Context,
 				conf.GetWebTimeouts().Shutdown)
 			defer cancel()
 
-			if err := server.Shutdown(shutdownCtx); err != nil {
-				logger.WarningError("cannot shutdown web proxy server", err)
-			}
-
 			if err := handler.Shutdown(shutdownCtx); err != nil {
 				logger.WarningError("cannot shutdown web proxy handler", err)
+			}
+
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				logger.WarningError("cannot shutdown web proxy server", err)
 			}
 		})
 	}
