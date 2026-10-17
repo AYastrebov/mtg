@@ -20,18 +20,32 @@ $ python3 -m http.server 8099 --bind 127.0.0.1
    `mtg access`, the `dd...` hex string).
 3. Press Connect.
 
-The log should show, in order:
+Every log line starts with a timestamp. Messages from the bridge are
+logged as JSON objects, binary batches as a list of frames. The log should
+show, in order (timestamps left out):
 
 ```
-status: connecting
-status: connected
-frames: WELCOME stream=0 len=...
-frames: CLOSE stream=1 len=...
+loading https://mtg.example.com/?bridge=...
+init sent
+sent HELLO
+sent OPEN 1 + DATA 1 (64 zero bytes)
+{"t":"status","state":"connecting"}
+frames (8 bytes):
+  WELCOME stream=0 len=0
+{"t":"status","state":"connected"}
+frames (20 bytes):
+  WINDOW stream=1 len=4
+  CLOSE stream=1 len=0
 ```
 
-`CLOSE stream=1` is expected: the harness sends `OPEN 1` and a `DATA 1`
-with 64 zero bytes, which is not a valid obfuscated2 handshake, so the
-relay closes the stream. Other lines (`traffic`, `PING`) may appear.
+WELCOME is delivered before the `connected` status: it is the answer to
+the session request, and the bridge reports `connected` right after
+handing it over. `CLOSE stream=1` is expected: the harness sends `OPEN 1`
+and a `DATA 1` with 64 zero bytes, which is not a valid obfuscated2
+handshake, so the relay closes the stream. The `WINDOW` grant for the 64
+bytes may come in the same batch, in its own batch, or not at all.
+`{"t":"traffic",...}` lines may appear in between. The server
+never sends PING.
 
 ## Telegram Desktop
 

@@ -565,8 +565,7 @@ Limitations:
 1. Only the `https` carrier (long-poll) is implemented. There are no
    `https-lanes` and no WebSocket carriers.
 2. The site must be served at the domain root. A base path is not supported.
-3. Client support is at an early stage: Telegram Desktop works, mobile
-   clients vary.
+3. Client support is at an early stage.
 4. In multi-profile embedders of `mtglib/web`, bootstrap and rate budgets
    are global, so one profile can exhaust them for all the others.
 
