@@ -19,6 +19,7 @@ func (t *TypeCIDR) Set(value string) error {
 			return fmt.Errorf("incorrect CIDR (%s): %w", value, err)
 		}
 
+		addr = addr.Unmap()
 		prefix = netip.PrefixFrom(addr, addr.BitLen())
 	}
 

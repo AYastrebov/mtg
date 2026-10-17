@@ -12,6 +12,7 @@ import (
 	"github.com/9seconds/mtg/v2/internal/config"
 	"github.com/9seconds/mtg/v2/mtglib/web"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -165,41 +166,54 @@ func (suite *ConfigTestSuite) TestConfigWebOverrides() {
 }
 
 func (suite *ConfigTestSuite) TestConfigWebInvalid() {
+	const (
+		stageParse    = "parse"
+		stageValidate = "validate"
+	)
+
 	dir := suite.T().TempDir()
 
-	testData := map[string]string{
-		"both public options": `
+	testData := []struct {
+		name  string
+		stage string
+		extra string
+	}{
+		{"both public options", stageValidate, `
 hostname = "web.example.com"
 public-upstream = "http://127.0.0.1:8080"
-public-dir = "` + dir + `"`,
-		"no public option": `
-hostname = "web.example.com"`,
-		"uppercase hostname": `
+public-dir = "` + dir + `"`},
+		{"no public option", stageValidate, `
+hostname = "web.example.com"`},
+		{"uppercase hostname", stageValidate, `
 hostname = "Web.Example.com"
-public-upstream = "http://127.0.0.1:8080"`,
-		"no hostname": `
-public-upstream = "http://127.0.0.1:8080"`,
-		"https upstream": `
+public-upstream = "http://127.0.0.1:8080"`},
+		{"no hostname", stageValidate, `
+public-upstream = "http://127.0.0.1:8080"`},
+		{"https upstream", stageParse, `
 hostname = "web.example.com"
-public-upstream = "https://127.0.0.1:8080"`,
-		"short token key": `
+public-upstream = "https://127.0.0.1:8080"`},
+		{"short token key", stageParse, `
 hostname = "web.example.com"
 public-upstream = "http://127.0.0.1:8080"
-token-key = "` + base64.StdEncoding.EncodeToString(make([]byte, 16)) + `"`,
-		"small carrier batch": `
+token-key = "` + base64.StdEncoding.EncodeToString(make([]byte, 16)) + `"`},
+		{"small carrier batch", stageValidate, `
 hostname = "web.example.com"
 public-upstream = "http://127.0.0.1:8080"
 [web.limits]
-carrier-batch-bytes = "100kib"`,
+carrier-batch-bytes = "100kib"`},
 	}
 
-	for name, extra := range testData {
-		suite.T().Run(name, func(t *testing.T) {
-			conf, err := config.Parse([]byte(webTestBase + extra))
-			if err != nil {
-				return // rejected at parse time (type validation)
+	for _, tc := range testData {
+		suite.T().Run(tc.name, func(t *testing.T) {
+			conf, err := config.Parse([]byte(webTestBase + tc.extra))
+
+			if tc.stage == stageParse {
+				assert.Error(t, err)
+
+				return
 			}
 
+			require.NoError(t, err)
 			assert.Error(t, conf.Validate())
 		})
 	}
@@ -220,16 +234,23 @@ public-upstream = "http://127.0.0.1:8080"
 }
 
 func (suite *ConfigTestSuite) TestConfigWebDisabledSkipsValidation() {
-	conf, err := config.Parse([]byte(`
+	// TypeHost accepts the uppercase name, web.ValidateHostname does not.
+	const base = `
 secret = "7oe1GqLy6TBc38CV3jx7q09nb29nbGUuY29t"
 bind-to = "0.0.0.0:3128"
 
 [web]
-hostname = "Bad Host"
-`))
-	if err == nil {
-		suite.NoError(conf.Validate())
-	}
+hostname = "Web.Example.com"
+public-upstream = "http://127.0.0.1:8080"
+`
+
+	conf, err := config.Parse([]byte(base))
+	suite.Require().NoError(err)
+	suite.NoError(conf.Validate())
+
+	conf, err = config.Parse([]byte(base + "enabled = true\n"))
+	suite.Require().NoError(err)
+	suite.Error(conf.Validate())
 }
 
 func (suite *ConfigTestSuite) TestConfigWebTokenKeyNotLogged() {
