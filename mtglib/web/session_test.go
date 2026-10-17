@@ -1269,8 +1269,12 @@ func TestSessionBatchLimits(t *testing.T) {
 	t.Run("frames", func(t *testing.T) {
 		h := newTestSession(t, nil)
 
+		// DATA of distinct streams does not coalesce; this many control
+		// items would overflow maxControlItemsPerSession.
 		for i := range 5000 {
-			require.True(t, h.s.queueDownlink(Frame{Type: FrameClose, StreamID: uint32(i + 1)}, pendingControl))
+			require.True(t, h.s.queueDownlink(Frame{
+				Type: FrameData, StreamID: uint32(i + 1), Payload: []byte{1},
+			}, pendingDownlink))
 		}
 
 		frames, next := pollFrames(t, h.s, 0)

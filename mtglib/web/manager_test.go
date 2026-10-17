@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"sync"
 	"testing"
@@ -444,4 +445,74 @@ func TestManagerAddBytes(t *testing.T) {
 	st := h.m.stats()
 	assert.Equal(t, uint64(11), st.BytesUp)
 	assert.Equal(t, uint64(22), st.BytesDown)
+}
+
+func TestSessionControlQueueOverflow(t *testing.T) {
+	h := newTestManager(t, nil, func(l *Limits) { l.MaxStreamsPerSession = 1 })
+
+	_, flooder := h.create(t, testProfileIndex, testIP1)
+	_, sibling := h.create(t, testProfileIndex, testIP2)
+
+	require.Equal(t, maxControlItemsPerSession, flooder.controlItemsCap())
+
+	// The sibling has a live stream with a queued CLOSE of a refused OPEN.
+	_, err := sibling.processUp(1, batch(openFrame(1), openFrame(2)))
+	require.NoError(t, err)
+	waitServed(t, h.serve, 1)
+
+	// OPEN 1 is admitted, the other OPENs are refused and each queues a
+	// CLOSE: exactly the cap is still fine.
+	frames := [][]byte{openFrame(1)}
+	for id := range uint32(maxControlItemsPerSession) {
+		frames = append(frames, openFrame(id+2))
+	}
+
+	_, err = flooder.processUp(1, batch(frames...))
+	require.NoError(t, err)
+	require.False(t, isClosed(flooder))
+	assert.Equal(t, maxControlItemsPerSession+1, h.m.stats().PendingItems)
+
+	// One more refused OPEN overflows the flooder's control queue.
+	_, err = flooder.processUp(2, batch(openFrame(5000)))
+	require.ErrorIs(t, err, errSessionClosed)
+	assert.True(t, isClosed(flooder))
+
+	// Its budget is gone; the sibling keeps its CLOSE and its stream.
+	st := h.m.stats()
+	assert.Equal(t, 1, st.PendingItems)
+	assert.Equal(t, 1, st.StreamsLive)
+	assert.False(t, isClosed(sibling))
+
+	// The sibling's downlink still flows: proxy-side data reaches its poll.
+	conn := h.serve.conn(t, 0)
+	_, err = conn.Write([]byte("still here"))
+	require.NoError(t, err)
+
+	var (
+		data   []byte
+		cursor uint64
+	)
+
+	require.Eventually(t, func() bool {
+		body, next, err := sibling.poll(context.Background(), cursor, 50*time.Millisecond)
+		require.NoError(t, err)
+
+		cursor = next
+		if len(body) == 0 {
+			return false
+		}
+
+		parsed, err := ParseFrames(body, MaxFramePayload)
+		require.NoError(t, err)
+
+		for _, f := range parsed {
+			if f.Type == FrameData && f.StreamID == 1 {
+				data = append(data, f.Payload...)
+			}
+		}
+
+		return len(data) > 0
+	}, 2*time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, "still here", string(data))
 }

@@ -19,6 +19,16 @@ import (
 // immediately; releases in other sessions are only noticed by this timer.
 const downlinkRetryInterval = 50 * time.Millisecond
 
+// maxControlItemsPerSession caps the control frames (WINDOW, CLOSE) a single
+// session may hold queued or unacknowledged. The control reserve is a pool
+// shared by all sessions; without this cap one session could fill it, for
+// example with a flood of refused OPENs that a client never polls the CLOSEs
+// for, and starve every other session's control frames. A session hitting
+// the cap is closed as a protocol violation. Configurations with more
+// streams per session get their whole control reserve
+// (Limits.controlReserveItems) instead.
+const maxControlItemsPerSession = 1024
+
 // serveFunc hands a proxy-facing stream end to mtglib. It must not block
 // for the lifetime of the stream.
 type serveFunc func(conn essentials.Conn, secretIdx int) error
@@ -272,6 +282,11 @@ func (s *session) sessionAllowsLocked(class pendingClass, bytes int64, items int
 	return false
 }
 
+// controlItemsCap is how many control items the session may hold.
+func (s *session) controlItemsCap() int {
+	return max(maxControlItemsPerSession, s.limits.controlReserveItems())
+}
+
 func (s *session) downlinkBytesCap() int64 {
 	return s.limits.MaxPendingPerSession - s.limits.controlReserveBytes() - s.limits.uplinkReserveBytes()
 }
@@ -367,6 +382,13 @@ func (s *session) queueDownlinkLocked(f Frame, class pendingClass) bool {
 
 	if s.coalesceLocked(f) {
 		return true
+	}
+
+	if class == pendingControl && s.pendingItems[pendingControl] >= s.controlItemsCap() {
+		s.logger.Info("protocol violation: control queue overflow")
+		s.closeLocked()
+
+		return false
 	}
 
 	size := int64(len(f.Payload))

@@ -567,6 +567,8 @@ Limitations:
 2. The site must be served at the domain root. A base path is not supported.
 3. Client support is at an early stage: Telegram Desktop works, mobile
    clients vary.
+4. In multi-profile embedders of `mtglib/web`, bootstrap and rate budgets
+   are global, so one profile can exhaust them for all the others.
 
 If you want to check a deployment without Telegram, use the
 [bridge harness](./contrib/web-bridge-harness/README.md).
