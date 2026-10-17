@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -518,4 +519,175 @@ func TestHandleDownBodyReadErrorIs404(t *testing.T) {
 	c.handleDown(rec, r, h.s)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 	assert.False(t, isClosed(h.s))
+}
+
+func downBusy(s *session) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.downBusy
+}
+
+// queueLargeBatch queues about 2 MiB of downlink DATA: one full batch.
+func queueLargeBatch(t *testing.T, s *session) {
+	t.Helper()
+
+	for id := range uint32(2) {
+		require.True(t, s.queueDownlink(Frame{
+			Type: FrameData, StreamID: id + 1, Payload: bytes.Repeat([]byte{'x'}, 1<<20-64),
+		}, pendingDownlink))
+	}
+}
+
+// stalledDown starts a real server around c.handleDown with tiny socket
+// buffers and sends it a /down from a raw client that never reads. It
+// returns a channel closed when the handler has returned.
+func stalledDown(t *testing.T, c *httpsCarrier, s *session) <-chan struct{} {
+	t.Helper()
+
+	done := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+
+		c.handleDown(w, r, s)
+	}))
+	srv.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		if tcp, ok := conn.(*net.TCPConn); ok && state == http.StateNew {
+			_ = tcp.SetWriteBuffer(4096)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		require.NoError(t, tcp.SetReadBuffer(4096))
+	}
+
+	_, err = conn.Write([]byte("POST /api/v1/down HTTP/1.1\r\nHost: example.com\r\n" +
+		"X-Down-Cursor: 0\r\nContent-Length: 0\r\n\r\n"))
+	require.NoError(t, err)
+
+	return done
+}
+
+func TestBodyWriteTimeout(t *testing.T) {
+	assert.Equal(t, 30*time.Second, bodyWriteTimeout)
+	assert.Equal(t, bodyWriteTimeout, newHTTPSCarrier(DefaultLimits(), DefaultTimeouts()).writeTimeout)
+}
+
+func TestHandleDownStalledReaderIsBounded(t *testing.T) {
+	c, h := newTestCarrier(t, nil)
+	c.writeTimeout = 300 * time.Millisecond
+	c.onBytes = func(_, _ uint64) { t.Error("a stalled body must not count as delivered") }
+
+	queueLargeBatch(t, h.s)
+
+	start := time.Now()
+	done := stalledDown(t, c, h.s)
+
+	// the write is stuck: the slot is held and the handler has not returned
+	require.Eventually(t, func() bool { return downBusy(h.s) }, 2*time.Second, time.Millisecond)
+
+	select {
+	case <-done:
+		t.Fatal("the response was absorbed by socket buffers; the test does not stall")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// A concurrent /down (acking the batch or replaying it) is refused
+	// before it can ack: the batch stays charged while it is written.
+	bs, _ := h.sink.totals()
+	charged := bs[pendingDownlink]
+	require.NotZero(t, charged)
+
+	for _, cursor := range []string{"1", "0"} {
+		rec := httptest.NewRecorder()
+		c.handleDown(rec, downRequest(cursor, nil), h.s)
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code, cursor)
+		assert.Equal(t, "1", rec.Header().Get("Retry-After"), cursor)
+		assert.Empty(t, rec.Header().Get("X-Down-Cursor"), cursor)
+	}
+
+	bs, _ = h.sink.totals()
+	assert.Equal(t, charged, bs[pendingDownlink])
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stalled write did not hit its deadline")
+	}
+
+	assert.GreaterOrEqual(t, time.Since(start), c.writeTimeout)
+	assert.False(t, downBusy(h.s))
+	assert.False(t, isClosed(h.s))
+
+	// the slot is free again: the lost batch is replayed, then acked
+	c.onBytes = nil
+	rec := httptest.NewRecorder()
+	c.handleDown(rec, downRequest("0", nil), h.s)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "1", rec.Header().Get("X-Down-Cursor"))
+	assert.Len(t, rec.Body.Bytes(), 2*(FrameHeaderSize+1<<20-64))
+
+	c.timeouts.LongPoll = 10 * time.Millisecond
+	rec = httptest.NewRecorder()
+	c.handleDown(rec, downRequest("1", nil), h.s)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+
+	bs, _ = h.sink.totals()
+	assert.Zero(t, bs[pendingDownlink])
+}
+
+func TestHandleDownStalledReaderSessionClosed(t *testing.T) {
+	c, h := newTestCarrier(t, nil)
+	c.writeTimeout = 300 * time.Millisecond
+
+	queueLargeBatch(t, h.s)
+
+	done := stalledDown(t, c, h.s)
+	require.Eventually(t, func() bool { return downBusy(h.s) }, 2*time.Second, time.Millisecond)
+
+	h.s.close()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stalled write did not hit its deadline")
+	}
+
+	assert.False(t, downBusy(h.s))
+
+	rec := httptest.NewRecorder()
+	c.handleDown(rec, downRequest("0", nil), h.s)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// failingWriter fails every body write.
+type failingWriter struct {
+	*httptest.ResponseRecorder
+}
+
+func (f failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("connection reset")
+}
+
+func TestHandleDownWriteErrorReleasesSlot(t *testing.T) {
+	c, h := newTestCarrier(t, nil)
+	c.onBytes = func(_, _ uint64) { t.Error("a failed body must not count as delivered") }
+
+	require.True(t, h.s.queueDownlink(Frame{Type: FrameData, StreamID: 7, Payload: []byte("hello")}, pendingDownlink))
+
+	c.handleDown(failingWriter{httptest.NewRecorder()}, downRequest("0", nil), h.s)
+	assert.False(t, downBusy(h.s))
+
+	c.onBytes = nil
+	rec := httptest.NewRecorder()
+	c.handleDown(rec, downRequest("0", nil), h.s)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, dataFrame(7, []byte("hello")), rec.Body.Bytes())
+	assert.False(t, downBusy(h.s))
 }

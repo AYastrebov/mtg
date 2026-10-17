@@ -58,7 +58,7 @@ type budgetSink interface {
 var (
 	errSessionProtocol = errors.New("web session protocol violation")
 	errBackpressure    = errors.New("web session backpressure")
-	errConcurrent      = errors.New("concurrent uplink request")
+	errConcurrent      = errors.New("concurrent web request")
 	errSessionClosed   = errors.New("web session is closed")
 	errCursor          = fmt.Errorf("%w: unexpected downlink cursor", errSessionProtocol)
 )
@@ -139,6 +139,9 @@ type session struct {
 	unackedBody []byte
 	// waiter is closed to supersede the currently parked poll.
 	waiter chan struct{}
+	// downBusy is the downlink write slot: set while a handler writes a
+	// downlink body handed out by poll, until endDownload.
+	downBusy bool
 
 	isClosed bool
 	done     chan struct{}
@@ -1023,13 +1026,25 @@ func (s *session) applyLocked(frames []Frame, charged []bool) []*stream {
 // if there is nothing to send) and the cursor the client has to send next.
 // The returned body is shared with a possible retry and must not be
 // modified.
+//
+// A non-empty body comes with the session's single downlink write slot,
+// taken under the same lock that hands the body out; the caller must
+// release it with endDownload once the body is written (or failed). While
+// the slot is held, poll refuses with errConcurrent before acknowledging
+// anything, so a batch stays charged to the budgets until its write ends.
+// A parked poll does not hold the slot: a newer poll still supersedes it.
 func (s *session) poll(ctx context.Context, cursor uint64, longPoll time.Duration) ([]byte, uint64, error) {
 	s.mu.Lock()
 
-	if s.isClosed {
+	switch {
+	case s.isClosed:
 		s.mu.Unlock()
 
 		return nil, 0, errSessionClosed
+	case s.downBusy:
+		s.mu.Unlock()
+
+		return nil, 0, errConcurrent
 	}
 
 	s.activity = s.now()
@@ -1038,6 +1053,7 @@ func (s *session) poll(ctx context.Context, cursor uint64, longPoll time.Duratio
 	case s.unacked != nil && cursor == s.downCursor-1:
 		// the previous response was lost: replay it verbatim
 		body, next := s.unackedBody, s.downCursor
+		s.downBusy = true
 		s.mu.Unlock()
 
 		return body, next, nil
@@ -1073,6 +1089,7 @@ func (s *session) poll(ctx context.Context, cursor uint64, longPoll time.Duratio
 		case len(s.downlink) > 0:
 			s.dropWaiterLocked(mine)
 			body, next := s.cutBatchLocked()
+			s.downBusy = true
 			s.activity = s.now()
 			s.mu.Unlock()
 
@@ -1108,6 +1125,14 @@ func (s *session) poll(ctx context.Context, cursor uint64, longPoll time.Duratio
 
 		s.mu.Lock()
 	}
+}
+
+// endDownload releases the downlink write slot that poll handed out with a
+// non-empty body.
+func (s *session) endDownload() {
+	s.mu.Lock()
+	s.downBusy = false
+	s.mu.Unlock()
 }
 
 func (s *session) dropWaiterLocked(mine chan struct{}) {

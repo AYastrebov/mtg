@@ -30,6 +30,8 @@ func TestLimitsValidateRejects(t *testing.T) {
 		"batch above 2MiB":  func(l *Limits) { l.MaxBodyBytes = 4 << 20; l.CarrierBatchBytes = 3 << 20 },
 		"reserve bytes":     func(l *Limits) { l.MaxSessions = 100000 },
 		"reserve items":     func(l *Limits) { l.MaxPendingItemsGlobal = 1000 },
+		"reviewer global":   func(l *Limits) { l.MaxPendingGlobal = 13721601 },
+		"14MiB global":      func(l *Limits) { l.MaxPendingGlobal = 14 << 20 },
 		"frame payload big": func(l *Limits) { l.MaxFramePayload = 2 << 20 },
 		"frame payload 0":   func(l *Limits) { l.MaxFramePayload = 0 },
 		"sessions MaxInt":   func(l *Limits) { l.MaxSessions = math.MaxInt },
@@ -210,4 +212,62 @@ func TestRateBucket(t *testing.T) {
 	assert.True(t, b.take(now))
 	assert.True(t, b.take(now))
 	assert.False(t, b.take(now))
+}
+
+func TestLimitsPendingGlobalMinimum(t *testing.T) {
+	l := DefaultLimits()
+
+	// the manager keeps the control reserve of every possible session
+	idle := int64(l.MaxSessions) * l.controlReserveBytes()
+	assert.Equal(t, int64(13721600), idle)
+
+	minimum := idle + l.uplinkReserveBytes() + (1 << 20)
+	assert.Equal(t, minimum, l.minPendingGlobal())
+
+	l.MaxPendingGlobal = 13721601 // one byte above the idle reserves
+	err := l.validate()
+	require.ErrorIs(t, err, ErrLimits)
+	assert.Contains(t, err.Error(), "MaxPendingGlobal")
+	assert.Contains(t, err.Error(), strconv.FormatInt(minimum, 10))
+
+	l.MaxPendingGlobal = minimum - 1
+	require.ErrorIs(t, l.validate(), ErrLimits)
+
+	l.MaxPendingGlobal = minimum
+	require.NoError(t, l.validate())
+
+	// what is left beside the idle reserves takes one maximal upload and
+	// still leaves the downlink 1 MiB
+	assert.Equal(t, l.uplinkReserveBytes()+(1<<20), l.MaxPendingGlobal-idle)
+}
+
+func TestLimitsPendingItemsGlobalMinimum(t *testing.T) {
+	l := DefaultLimits()
+
+	minimum := int64(l.MaxSessions*l.controlReserveItems() + l.uplinkReserveItems() + 1)
+	assert.Equal(t, minimum, l.minPendingItemsGlobal())
+
+	l.MaxPendingItemsGlobal = l.MaxSessions*l.controlReserveItems() + 1
+	err := l.validate()
+	require.ErrorIs(t, err, ErrLimits)
+	assert.Contains(t, err.Error(), "MaxPendingItemsGlobal")
+	assert.Contains(t, err.Error(), strconv.FormatInt(minimum, 10))
+
+	l.MaxPendingItemsGlobal = int(minimum) - 1
+	require.ErrorIs(t, l.validate(), ErrLimits)
+
+	l.MaxPendingItemsGlobal = int(minimum)
+	require.NoError(t, l.validate())
+}
+
+func TestLimitsPendingGlobalMinimumNoOverflow(t *testing.T) {
+	l := DefaultLimits()
+	l.MaxSessions = maxCount
+	l.MaxStreamsPerSession = maxStreamsPerSessionLimit
+	l.MaxPendingGlobal = maxBytesLimit
+	l.MaxPendingItemsGlobal = maxCount
+
+	assert.Positive(t, l.minPendingGlobal())
+	assert.Positive(t, l.minPendingItemsGlobal())
+	require.ErrorIs(t, l.validate(), ErrLimits)
 }

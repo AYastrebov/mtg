@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 const octetStream = "application/octet-stream"
@@ -15,6 +16,8 @@ const octetStream = "application/octet-stream"
 type httpsCarrier struct {
 	limits   Limits
 	timeouts Timeouts
+	// writeTimeout bounds writing one downlink body (bodyWriteTimeout).
+	writeTimeout time.Duration
 
 	// onBytes, if set, is told about every accepted uplink body and every
 	// delivered downlink body.
@@ -22,7 +25,7 @@ type httpsCarrier struct {
 }
 
 func newHTTPSCarrier(limits Limits, timeouts Timeouts) *httpsCarrier {
-	return &httpsCarrier{limits: limits, timeouts: timeouts}
+	return &httpsCarrier{limits: limits, timeouts: timeouts, writeTimeout: bodyWriteTimeout}
 }
 
 func (c *httpsCarrier) mode() string {
@@ -141,11 +144,18 @@ func (c *httpsCarrier) handleDown(w http.ResponseWriter, r *http.Request, s *ses
 	}
 
 	// body is shared with a possible replay: it is written, never modified.
+	// A non-empty body comes with the session's downlink write slot: while
+	// it is written, another poll is refused (503) before it can ack the
+	// batch, so the body stays charged to the budgets until the write ends.
 	body, next, err := s.poll(r.Context(), cursor, c.timeouts.LongPoll)
 
 	switch {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return // the client went away; nobody is listening
+	case errors.Is(err, errConcurrent):
+		retryLater(w)
+
+		return
 	case err != nil: // errCursor, errSessionClosed
 		localNotFound(w)
 
@@ -153,20 +163,47 @@ func (c *httpsCarrier) handleDown(w http.ResponseWriter, r *http.Request, s *ses
 	}
 
 	h := w.Header()
-	h.Set("Cache-Control", "no-store")
-	h.Set("X-Down-Cursor", strconv.FormatUint(next, 10))
 
 	if len(body) == 0 {
+		h.Set("Cache-Control", "no-store")
+		h.Set("X-Down-Cursor", strconv.FormatUint(next, 10))
 		w.WriteHeader(http.StatusNoContent)
 
 		return
 	}
 
+	c.writeBody(w, s, body, next)
+}
+
+// writeBody writes a non-empty downlink batch and releases the session's
+// downlink write slot that poll handed out with it. A reader that stops
+// consuming must not hold the slot and the body forever: the write and the
+// flush run under a deadline. On any failure the batch stays
+// unacknowledged and the client's retry replays it.
+func (c *httpsCarrier) writeBody(w http.ResponseWriter, s *session, body []byte, next uint64) {
+	defer s.endDownload()
+
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		retryLater(w)
+
+		return
+	}
+
+	defer rc.SetWriteDeadline(time.Time{}) //nolint: errcheck
+
+	h := w.Header()
+	h.Set("Cache-Control", "no-store")
+	h.Set("X-Down-Cursor", strconv.FormatUint(next, 10))
 	h.Set("Content-Type", octetStream)
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 
 	if _, err := w.Write(body); err != nil {
+		return
+	}
+
+	if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
 		return
 	}
 

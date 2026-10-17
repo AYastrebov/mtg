@@ -1184,6 +1184,10 @@ func goPoll(ctx context.Context, s *session, cursor uint64, longPoll time.Durati
 
 	go func() {
 		body, next, err := s.poll(ctx, cursor, longPoll)
+		if len(body) > 0 {
+			s.endDownload() // nothing is written here
+		}
+
 		ch <- pollResult{body: body, next: next, err: err, at: time.Now()}
 	}()
 
@@ -1200,6 +1204,7 @@ func TestSessionPollReturnsBatchAndCursor(t *testing.T) {
 	body, next, err := h.s.poll(ctx, 0, time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), next)
+	h.s.endDownload()
 
 	frames, err := ParseFrames(body, MaxFramePayload)
 	require.NoError(t, err)
@@ -1220,6 +1225,7 @@ func TestSessionPollReturnsBatchAndCursor(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), next)
 	assert.Equal(t, body, again)
+	h.s.endDownload()
 
 	start := time.Now()
 	body, next, err = h.s.poll(ctx, 1, 10*time.Millisecond)
@@ -1250,6 +1256,7 @@ func TestSessionPollCursorMismatchWithUnacked(t *testing.T) {
 	_, next, err := h.s.poll(ctx, 0, time.Second)
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), next)
+	h.s.endDownload()
 
 	_, _, err = h.s.poll(ctx, 2, time.Second)
 	require.ErrorIs(t, err, errCursor)
@@ -1382,6 +1389,7 @@ func pollFrames(t *testing.T, s *session, cursor uint64) ([]Frame, uint64) {
 
 	body, next, err := s.poll(context.Background(), cursor, time.Second)
 	require.NoError(t, err)
+	s.endDownload()
 
 	frames, err := ParseFrames(body, MaxFramePayload)
 	require.NoError(t, err)
@@ -1467,4 +1475,40 @@ func TestSessionPollAckWakesDownlinkPump(t *testing.T) {
 	bs, items := h.sink.totals()
 	assert.Equal(t, [3]int64{}, bs)
 	assert.Equal(t, [3]int{}, items)
+}
+
+func TestSessionPollRefusedWhileWriting(t *testing.T) {
+	h := newTestSession(t, nil)
+	ctx := context.Background()
+
+	require.True(t, h.s.queueDownlink(Frame{Type: FrameData, StreamID: 7, Payload: []byte("hello")}, pendingDownlink))
+
+	body, next, err := h.s.poll(ctx, 0, time.Second)
+	require.NoError(t, err)
+	require.NotEmpty(t, body)
+	require.Equal(t, uint64(1), next)
+
+	// the body is being written: neither an ack nor a replay gets in
+	for _, cursor := range []uint64{1, 0} {
+		_, _, err = h.s.poll(ctx, cursor, time.Second)
+		require.ErrorIs(t, err, errConcurrent)
+	}
+
+	_, items := h.sink.totals()
+	assert.Equal(t, 1, items[pendingDownlink])
+	assert.False(t, isClosed(h.s))
+
+	h.s.endDownload()
+
+	// an empty poll does not take the slot
+	body, next, err = h.s.poll(ctx, 1, 0)
+	require.NoError(t, err)
+	assert.Empty(t, body)
+	assert.Equal(t, uint64(1), next)
+
+	_, items = h.sink.totals()
+	assert.Zero(t, items[pendingDownlink])
+
+	_, _, err = h.s.poll(ctx, 1, 0)
+	require.NoError(t, err)
 }

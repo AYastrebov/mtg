@@ -54,6 +54,10 @@ type Limits struct {
 	MaxPendingItemsPerSession int
 	MaxPendingItemsGlobal     int
 
+	// CarrierBatchBytes caps one downlink response body. A session writes
+	// at most one downlink body at a time, under a write deadline, so
+	// in-flight download memory is bounded by MaxSessions ×
+	// CarrierBatchBytes.
 	CarrierBatchBytes int
 	// MaxBodyBytes caps one uplink request body. A session reads at most
 	// one uplink body at a time, so in-flight upload memory is bounded by
@@ -197,16 +201,35 @@ func (l Limits) validate() error {
 			ErrLimits, l.MaxFramePayload, maxFramePayloadLimit)
 	}
 
-	// Division instead of multiplication: reserve*MaxSessions < Global.
-	if int64(l.MaxSessions) > (l.MaxPendingGlobal-1)/l.controlReserveBytes() {
-		return fmt.Errorf("%w: control reserve of MaxSessions exhausts MaxPendingGlobal", ErrLimits)
+	if minimum := l.minPendingGlobal(); l.MaxPendingGlobal < minimum {
+		return fmt.Errorf("%w: MaxPendingGlobal %d is below the minimum %d "+
+			"(control reserves of MaxSessions, one uplink reserve and 1 MiB of downlink)",
+			ErrLimits, l.MaxPendingGlobal, minimum)
 	}
 
-	if int64(l.MaxSessions) > (int64(l.MaxPendingItemsGlobal)-1)/int64(l.controlReserveItems()) {
-		return fmt.Errorf("%w: control reserve of MaxSessions exhausts MaxPendingItemsGlobal", ErrLimits)
+	if minimum := l.minPendingItemsGlobal(); int64(l.MaxPendingItemsGlobal) < minimum {
+		return fmt.Errorf("%w: MaxPendingItemsGlobal %d is below the minimum %d "+
+			"(control item reserves of MaxSessions, one uplink item reserve and 1 downlink item)",
+			ErrLimits, l.MaxPendingItemsGlobal, minimum)
 	}
 
 	return l.validateSessionBudget()
+}
+
+// minPendingGlobal is the smallest MaxPendingGlobal that, beside the control
+// reserves the manager keeps for all MaxSessions up front (even on an idle
+// server), still admits one maximal uplink body and 1 MiB of downlink.
+// With the count caps above (MaxSessions <= 1<<30, controlReserveBytes
+// below 1<<30) the product stays far below MaxInt64.
+func (l Limits) minPendingGlobal() int64 {
+	return int64(l.MaxSessions)*l.controlReserveBytes() + l.uplinkReserveBytes() + minDownlinkBytes
+}
+
+// minPendingItemsGlobal is minPendingGlobal for items: the control item
+// reserves of MaxSessions, one uplink item reserve and 1 downlink item. It
+// is computed in int64 so that it cannot overflow on 32-bit builds.
+func (l Limits) minPendingItemsGlobal() int64 {
+	return int64(l.MaxSessions)*int64(l.controlReserveItems()) + int64(l.uplinkReserveItems()) + 1
 }
 
 // minPendingPerSession is the smallest MaxPendingPerSession that leaves the

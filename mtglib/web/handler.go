@@ -29,6 +29,10 @@ const (
 	// the protocol keeps bodies under the carrier read deadline, so a
 	// secret holder cannot trickle a body and hold a request forever.
 	bodyReadTimeout = 30 * time.Second
+	// bodyWriteTimeout bounds writing a downlink response body: a reader
+	// that stops consuming cannot hold the session's downlink write slot
+	// and the body's memory longer than this.
+	bodyWriteTimeout = 30 * time.Second
 
 	bridgeQueryPrefix = "bridge="
 	bearerPrefix      = "Bearer "
